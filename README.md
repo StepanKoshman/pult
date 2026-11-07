@@ -31,7 +31,7 @@
 
 ## Запуск
 
-Скачайте [`dist/pult.html`](dist/pult.html) и откройте в браузере.
+Скачайте `pult.html` из [последнего выпуска](https://github.com/StepanKoshman/pult/releases/latest) (или [`dist/pult.html`](dist/pult.html) из репозитория) и откройте в браузере.
 
 | Подключение | Браузер |
 |---|---|
