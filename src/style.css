@@ -233,3 +233,9 @@ details p { margin-top: 6px; max-width: 66ch; }
   #tabs { order: 5; flex-basis: 100%; }
 }
 @media (prefers-reduced-motion: reduce) { .bargraph .fill { transition: none; } }
+/* tinySA */
+.sa-f { width: 9.5em; }
+.sa-n { width: 7.5em; }
+fieldset.sa-set { border: 1px solid var(--line); border-radius: 4px; margin: 0 0 8px; padding: 4px 8px 8px; min-width: 0; }
+fieldset.sa-set legend { font: 600 .8em/1.2 var(--f-label); letter-spacing: .08em; color: var(--ink3); text-transform: uppercase; padding: 0 4px; }
+fieldset.sa-set .row { align-items: flex-end; }

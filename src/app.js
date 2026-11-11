@@ -4,6 +4,7 @@
 const WINDOW_GROUPS = [
   ['Любой прибор', [['reading', 'Большое показание', 'Одна величина крупно, статистика'], ['table', 'Таблица величин', 'Много величин, мин, макс, среднее'], ['trend', 'Тренд', 'История на отдельных дорожках'], ['recorder', 'Запись данных', 'Выбранные величины в CSV'], ['console', 'Консоль SCPI', 'Ручные команды и ответы'], ['quantities', 'Величины', 'Добавить, изменить, убрать'], ['settings', 'Настройки прибора', 'Все параметры списком']]],
   ['LT1', [['lt1-lcr', 'Измеритель', 'R, L, C, Z, D, Q, θ и настройки'], ['lt1-sweep', 'АЧХ и ФЧХ', 'Скан на 100 точек']]],
+  ['tinySA', [['sa-spectrum', 'Анализатор спектра', 'Скан до 100000 точек, пики, водопад'], ['sa-screen', 'Экран', 'Трансляция экрана и нажатия'], ['sa-settings', 'Настройки', 'Режим, приём, генератор, команды']]],
   ['DM40', [['dm40-dmm', 'Мультиметр', 'Функции, пределы, скорость'], ['dm40-scope', 'Осциллограф', 'Живой сигнал, спектр, курсоры, запись'], ['dm40-gen', 'Генератор', 'Форма, частота, размах'], ['dm40-power', 'Ваттметр', 'P, S, Q, PF, энергия'], ['dm40-stream', 'Поток преобразователя', 'Каждый отсчёт AD1 или AD2'], ['dm40-decode', 'Декодер', 'UART, Modbus, DALI'], ['dm40-inrush', 'Пусковой ток', 'Захват броска тока'], ['dm40-files', 'Файлы', 'Снимки, записи, журналы'], ['dm40-screen', 'Экран прибора', 'Управление касанием через USB']]],
 ];
 
@@ -22,6 +23,11 @@ const DEFAULT_LAYOUT = () => [
   { name: 'АЧХ и ФЧХ', wins: [
     { type: 'lt1-sweep', cfg: {}, g: { x: 16, y: 16, w: 856, h: 560 } },
     { type: 'lt1-lcr', cfg: {}, g: { x: 888, y: 16, w: 440, h: 560 } },
+  ] },
+  { name: 'Спектр', wins: [
+    { type: 'sa-spectrum', cfg: {}, g: { x: 16, y: 16, w: 880, h: 696 } },
+    { type: 'sa-screen', cfg: {}, g: { x: 912, y: 16, w: 560, h: 384 } },
+    { type: 'sa-settings', cfg: {}, g: { x: 912, y: 416, w: 560, h: 296 } },
   ] },
   { name: 'Данные', wins: [
     { type: 'recorder', cfg: {}, g: { x: 16, y: 16, w: 384, h: 344 } },
@@ -60,10 +66,10 @@ const App = {
     const body = h('div', { class: 'col' },
       h('div', { class: 'cards' },
         card(UsbTmc.available, 'USB-кабель', 'USBTMC: LT1, DM40 и другие SCPI-приборы. Самая высокая скорость.', () => UsbTmc.pick()),
-        card(SerialLink.available, 'COM-порт и Bluetooth SPP', 'DM40 по классическому Bluetooth: сначала сопрягите его в системе. Подходит и для адаптеров USB-UART.', () => SerialLink.pick(+baud.value)),
+        card(SerialLink.available, 'COM-порт и Bluetooth SPP', 'tinySA по USB (виртуальный COM-порт). DM40 по классическому Bluetooth: сначала сопрягите его в системе. Подходит и для адаптеров USB-UART.', () => SerialLink.pick(+baud.value)),
         card(BleLink.available, 'Bluetooth LE', 'Прямое подключение без сопряжения. Канал обмена ищется автоматически.', () => BleLink.pick()),
         h('button', { class: 'card', onclick: () => { d.close(); store.set('wsUrl', wsUrl.value); this.connect(async () => new WsLink(wsUrl.value)); } }, h('b', { text: 'Мост WebSocket' }), h('small', { text: 'Для Firefox и Safari: прибор подключается через bridge.py.' })),
-        h('button', { class: 'card', onclick: () => { d.close(); this.startDemo(); } }, h('b', { text: 'Демо' }), h('small', { text: 'Симуляторы LT1 и DM40 со случайными данными.' }))),
+        h('button', { class: 'card', onclick: () => { d.close(); this.startDemo(); } }, h('b', { text: 'Демо' }), h('small', { text: 'Симуляторы LT1, DM40 и tinySA со случайными данными.' }))),
       h('div', { class: 'row wrap' }, field('Скорость COM-порта', baud), field('Адрес моста', wsUrl)),
       h('details', {}, h('summary', { text: 'DM40 не появляется в списке USB (Windows)' }),
         h('p', { text: 'Windows не содержит драйвера USBTMC, поэтому браузер не может открыть этот интерфейс. Сборка opendm40 с поддержкой этой программы подключает WinUSB сама. На более старых сборках установите WinUSB один раз через Zadig: Options > List All Devices, выберите интерфейс USBTMC устройства DM40 (не mass storage), WinUSB, Install Driver. Диск при этом продолжит работать.' })),
@@ -123,6 +129,7 @@ const App = {
       const tr = new SimLink(new Sim());
       await Devices.attach(tr).catch(e => toast(e.message, 'bad'));
     }
+    await Devices.attach(new SimSaLink()).catch(e => toast(e.message, 'bad'));
   },
   addCalc(c, keep) {
     const q = Hub.define({ id: c.id, name: c.name, unit: c.unit, dev: 'calc', group: 'Формулы', digits: 5 });

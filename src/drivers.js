@@ -341,11 +341,20 @@ const Devices = new (class extends Emitter {
   async attach(tr) {
     await tr.open();
     const link = new Link(tr);
-    let idn;
-    try { idn = await link.query('*IDN?', { timeout: 2500 }); }
-    catch (e) { await tr.close(); throw new Error('Прибор не ответил на *IDN?. Проверьте кабель и что в приборе включён нужный режим.'); }
-    const Cls = [DM40, LT1].find(c => c.probe(idn)) || GenericScpi;
-    const dev = new Cls(link, idn);
+    let idn, sa = null;
+    const usb = tr.port?.getInfo?.() || {};
+    /* tinySA: COM-порт 0483:5740 с оболочкой вместо SCPI. Его спрашиваем первым, иначе *IDN? ждёт до таймаута. */
+    if (tr.kind === 'sim' ? tr.parser : usb.usbVendorId === 0x0483 && usb.usbProductId === 0x5740) sa = await TinySA.detect(link);
+    if (!sa) {
+      try { idn = await link.query('*IDN?', { timeout: 2500 }); }
+      catch (e) {
+        sa = await TinySA.detect(link);
+        if (!sa) { await tr.close(); throw new Error('Прибор не ответил на *IDN?. Проверьте кабель и что в приборе включён нужный режим.'); }
+      }
+    }
+    const Cls = sa ? TinySA : [DM40, LT1].find(c => c.probe(idn)) || GenericScpi;
+    const dev = new Cls(link, sa ? sa.idn : idn);
+    if (sa) { dev.p = sa.p; dev.info = sa.info; }
     const same = this.get(dev.id);
     if (same) await this.remove(same);
     await dev.start();

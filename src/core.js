@@ -46,7 +46,7 @@ function unitText(prefix, unit) {
 }
 
 const SI = [[1e9, 'G'], [1e6, 'M'], [1e3, 'k'], [1, ''], [1e-3, 'm'], [1e-6, 'µ'], [1e-9, 'n'], [1e-12, 'p']];
-const NO_PREFIX = new Set(['°C', '°F', '°', '%', '', 'Wh', 'PF']);
+const NO_PREFIX = new Set(['°C', '°F', '°', '%', '', 'Wh', 'PF', 'dBm', 'dB']);
 
 /* Разбивает число на мантиссу и приставку. digits: значащих цифр. */
 function siParts(v, unit, digits = 6) {

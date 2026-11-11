@@ -6,7 +6,7 @@ import re
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(ROOT, "src")
-ORDER = ["core.js", "transports.js", "sims.js", "drivers.js", "wm.js", "widgets.js", "spectrum.js", "panels.js", "app.js"]
+ORDER = ["core.js", "transports.js", "sims.js", "drivers.js", "wm.js", "widgets.js", "spectrum.js", "panels.js", "tinysa.js", "app.js"]
 
 
 def read(name):
