@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Пульт LT1 и DM40</title>
+<title>Пульт LT1, DM40, tinySA и C2</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=Saira+Semi+Condensed:wght@500;600&display=swap">
@@ -445,7 +445,7 @@ class UsbTmc extends Emitter {
   static get available() { return !!navigator.usb; }
   static filters = [
     { vendorId: 0x1209, productId: 0xD040 },       // DM40 с opendm40
-    { vendorId: 0x2E3C, productId: 0x5721 },       // LT1 с прошивкой fix5 (2.0)
+    { vendorId: 0x2E3C, productId: 0x5721 },       // LT1 с прошивкой fix5 (2.0 и новее)
     { classCode: 0xFE, subclassCode: 3 },          // любой USBTMC-прибор
   ];
   constructor(device) { super(); this.dev = device; this.tag = 1; this.kind = 'usb'; this.name = device?.productName || 'USB'; }
@@ -641,7 +641,7 @@ class BleLink extends Emitter {
   constructor(device) { super(); this.dev = device; this.parser = new StreamParser(); this.kind = 'bt'; this.name = device?.name || 'BLE'; this.mtu = 20; }
   static async pick() {
     return new BleLink(await navigator.bluetooth.requestDevice({
-      filters: [{ namePrefix: 'DM40' }, { namePrefix: 'C-1-ATK' }, { namePrefix: 'LT1' }, { namePrefix: 'ATK' }],
+      filters: [{ namePrefix: 'DM40' }, { namePrefix: 'C-1-ATK' }, { namePrefix: 'LT1' }, { namePrefix: 'ATK' }, { namePrefix: 'C2' }],
       optionalServices: BLE_SERVICES,
     }));
   }
@@ -745,6 +745,158 @@ function parseBlock(b) {
   if (d <= 0) return new Uint8Array(0);
   const size = parseInt(dec.decode(b.subarray(2, 2 + d)), 10);
   return b.subarray(2 + d, 2 + d + size);
+}
+
+/* ======================= ALIENTEK C2: бинарный протокол EE =======================
+   Не SCPI. Кадр в обе стороны: EE cmd len payload[len] ck, в ответе ещё хвост FF.
+   ck = (-сумма байт от EE до конца payload) & 0xFF. По USB каждый кадр в своём
+   пакете 64 байта, по Bluetooth кадры идут потоком, поэтому режем по EE и len. */
+const C2P = {
+  cksum(b, n) { let s = 0; for (let i = 0; i < n; i++) s += b[i]; return (-s) & 0xFF; },
+  frame(cmd, payload = []) {
+    const p = payload instanceof Uint8Array ? payload : Uint8Array.from(payload);
+    const f = new Uint8Array(4 + p.length);
+    f[0] = 0xEE; f[1] = cmd & 0xFF; f[2] = p.length; f.set(p, 3);
+    f[3 + p.length] = C2P.cksum(f, 3 + p.length);
+    return f;
+  },
+  reply(cmd, payload) { const f = C2P.frame(cmd, payload), o = new Uint8Array(f.length + 1); o.set(f); o[f.length] = 0xFF; return o; },
+};
+const c2hex = u => Array.from(u, b => b.toString(16).padStart(2, '0')).join(' ');
+
+/* Поток байт -> кадры EE. Интерфейс как у StreamParser: feed, flush, next. */
+class C2Frame {
+  constructor() { this.buf = new Uint8Array(1 << 12); this.len = 0; this.wait = null; this.bad = 0; }
+  feed(u) {
+    if (this.len + u.length > this.buf.length) {
+      const n = new Uint8Array(Math.max(this.buf.length * 2, this.len + u.length)); n.set(this.buf.subarray(0, this.len)); this.buf = n;
+    }
+    this.buf.set(u, this.len); this.len += u.length;
+    if (this.wait) { const w = this.wait; this.wait = null; w(); }
+  }
+  flush() { this.len = 0; }
+  drop(k) { this.buf.copyWithin(0, k, this.len); this.len -= k; }
+  take() {
+    for (; ;) {
+      let i = 0;
+      while (i < this.len && this.buf[i] !== 0xEE) i++;   // ресинхронизация и паддинг USB-пакета
+      if (i) this.drop(i);
+      if (this.len < 4) return null;
+      const L = this.buf[2], cmd = this.buf[1], need = 4 + L;
+      if (L > 59 || cmd < 1 || cmd > 0x20) { this.bad++; this.drop(1); continue; }   // кадр C2 всегда помещается в 64 байта
+      if (this.len < need) return null;
+      if (this.buf[3 + L] !== C2P.cksum(this.buf, 3 + L)) { this.bad++; this.drop(1); continue; }
+      const out = this.buf.slice(0, need);
+      this.drop(this.len > need && this.buf[need] === 0xFF ? need + 1 : need);
+      return out;
+    }
+  }
+  async next(timeout) {
+    const end = performance.now() + timeout;
+    for (; ;) {
+      const m = this.take();
+      if (m) return m;
+      const left = end - performance.now();
+      if (left <= 0) throw new TimeoutError();
+      await new Promise(r => { const id = setTimeout(() => { this.wait = null; r(); }, left); this.wait = () => { clearTimeout(id); r(); }; });
+    }
+  }
+}
+
+/* WebUSB, вендорный интерфейс C2 (bulk OUT 0x01, IN 0x82, 64 байта, Full-Speed).
+   Чтение идёт непрерывно и не ждёт запросов: так поток измерений не упирается в
+   пинг-понг и шина работает на пределе Full-Speed. */
+class UsbVendor extends Emitter {
+  static label = 'USB';
+  static get available() { return !!navigator.usb; }
+  static filters = [{ vendorId: 0x2E88, productId: 0xC2C2 }, { vendorId: 0x2E88 }];
+  static match(d) { return d?.vendorId === 0x2E88; }
+  constructor(device) { super(); this.dev = device; this.kind = 'usb'; this.proto = 'c2'; this.name = device?.productName || 'USB'; this.parser = new C2Frame(); this.rxBytes = 0; }
+  static async pick() { return new UsbVendor(await navigator.usb.requestDevice({ filters: UsbVendor.filters })); }
+  findIface() {
+    for (const cfg of this.dev.configurations) for (const i of cfg.interfaces) for (const a of i.alternates) {
+      let bi = 0, bo = 0, mps = 64;
+      for (const e of a.endpoints) {
+        if (e.type !== 'bulk') continue;
+        if (e.direction === 'in') { bi = e.endpointNumber; mps = e.packetSize || 64; } else bo = e.endpointNumber;
+      }
+      if (a.interfaceClass === 0xFF && bi && bo) return { cfg, iface: i, alt: a, bi, bo, mps };
+    }
+    return null;
+  }
+  async open() {
+    const d = this.dev;
+    await d.open();
+    if (!d.configuration) await d.selectConfiguration(d.configurations[0].configurationValue);
+    const f = this.findIface();
+    if (!f) throw new Error('У устройства нет вендорного интерфейса C2');
+    if (d.configuration.configurationValue !== f.cfg.configurationValue) await d.selectConfiguration(f.cfg.configurationValue);
+    this.ifn = f.iface.interfaceNumber;
+    await d.claimInterface(this.ifn);
+    if (f.alt.alternateSetting) await d.selectAlternateInterface(this.ifn, f.alt.alternateSetting);
+    this.epIn = f.bi; this.epOut = f.bo; this.mps = f.mps;
+    await d.clearHalt('in', this.epIn).catch(() => { });
+    await d.clearHalt('out', this.epOut).catch(() => { });
+    this.alive = true;
+    this.pump();
+  }
+  async pump() {
+    while (this.alive) {
+      let r;
+      try { r = await this.dev.transferIn(this.epIn, this.mps); }
+      catch (e) { if (this.alive) this.emit('lost', e); return; }
+      if (r.status === 'stall') { await this.dev.clearHalt('in', this.epIn).catch(() => { }); continue; }
+      if (r.status === 'babble') continue;
+      if (r.status !== 'ok') { if (this.alive) this.emit('lost', new Error('USB: ' + r.status)); return; }
+      if (r.data?.byteLength) { this.rxBytes += r.data.byteLength; this.parser.feed(new Uint8Array(r.data.buffer, r.data.byteOffset, r.data.byteLength)); }
+    }
+  }
+  async close() { this.alive = false; try { await this.dev.releaseInterface(this.ifn); } catch { } try { await this.dev.close(); } catch { } }
+  async send(data) { const r = await this.dev.transferOut(this.epOut, toBytes(data)); if (r.status === 'stall') { await this.dev.clearHalt('out', this.epOut).catch(() => { }); throw new Error('USB: stall'); } }
+  recv(timeout = 3000) { return this.parser.next(timeout); }
+  abort() { this.parser.flush(); }
+}
+
+/* Канал C2 поверх любого транспорта: одно непрерывное чтение кадров, запросы ждут
+   ответ своей командой, все кадры (и непрошеные, например поток измерений) уходят
+   событием 'frame'. Для BLE, SPP и моста перед open() ставится parser = C2Frame. */
+class C2Link extends Emitter {
+  constructor(tr) {
+    super(); this.tr = tr; this.alive = false; this.wait = new Map(); this.q = Promise.resolve();
+    this.bytes = 0; this.msgs = 0; this.errors = 0; this.log = null;
+    tr.on?.('lost', e => { if (this.alive) this.emit('lost', e); });
+  }
+  start() { if (this.alive) return; this.alive = true; this.loop(); }
+  async loop() {
+    while (this.alive) {
+      let f;
+      try { f = await this.tr.recv(1000); }
+      catch (e) { if (e instanceof TimeoutError) continue; if (this.alive) { this.errors++; this.emit('lost', e); } return; }
+      this.bytes += f.length; this.msgs++;
+      const cmd = f[1], payload = f.subarray(3, 3 + f[2]);
+      this.log?.('rx', c2hex(f));
+      const w = this.wait.get(cmd);
+      if (w) { this.wait.delete(cmd); clearTimeout(w.timer); w.res(payload); }
+      this.emit('frame', { cmd, payload, raw: f });
+    }
+  }
+  /* Отправки идут строго по очереди, чтобы кадры по Bluetooth не перемешались. */
+  send(cmd, payload = []) {
+    const fr = C2P.frame(cmd, payload);
+    const p = this.q.then(() => { this.log?.('tx', c2hex(fr)); return this.tr.send(fr); });
+    this.q = p.catch(() => { });
+    return p;
+  }
+  request(cmd, payload = [], { timeout = 2000 } = {}) {
+    return new Promise((res, rej) => {
+      const old = this.wait.get(cmd);
+      if (old) { clearTimeout(old.timer); old.rej(new Error('Запрос перекрыт новым')); }
+      const timer = setTimeout(() => { if (this.wait.get(cmd)?.res === res) { this.wait.delete(cmd); this.errors++; rej(new TimeoutError()); } }, timeout);
+      this.wait.set(cmd, { res, rej, timer });
+      this.send(cmd, payload).catch(e => { if (this.wait.get(cmd)?.res === res) { clearTimeout(timer); this.wait.delete(cmd); } this.errors++; rej(e); });
+    });
+  }
+  async close() { this.alive = false; for (const w of this.wait.values()) clearTimeout(w.timer); this.wait.clear(); try { await this.tr.close(); } catch { } }
 }
 
 /* Симуляторы: отвечают тем же SCPI, что и настоящие приборы, поэтому драйверы и окна
@@ -955,7 +1107,8 @@ class SimLT1 extends SimBase {
     const per = [260, 110, 45][s.speed] ?? 110;
     const want = Math.min(100, Math.floor((performance.now() - s.t0) / per));
     while (s.done < want) {
-      const i = s.done++, f = 100 * 1000 ** (i / 99), [re, im] = this.z(f), n = Math.hypot(re, im) * 8e-4 / (s.speed + 1) * (3 - s.speed);
+      // the 2.2 grid: 1 kHz exactly at point 34, 50 kHz last
+      const i = s.done++, f = i <= 34 ? 100 * 10 ** (i / 34) : 1000 * 50 ** ((i - 34) / 65), [re, im] = this.z(f), n = Math.hypot(re, im) * 8e-4 / (s.speed + 1) * (3 - s.speed);
       s.data[i * 3] = f; s.data[i * 3 + 1] = re + rnd(n); s.data[i * 3 + 2] = im + rnd(n);
     }
     if (s.done >= 100) s.run = 0;
@@ -963,7 +1116,7 @@ class SimLT1 extends SimBase {
   cmd(c) {
     const m = c.match(/^:?(\S+)\s*(.*)$/); if (!m) return null;
     const hd = m[1].toUpperCase(), arg = m[2].trim().toUpperCase(), q = hd.endsWith('?'), k = hd.replace(/\?$/, ''), num = parseFloat(arg);
-    if (k === '*IDN') return 'ALIENTEK,ATK-PTLT1,1C2D3E4F5A6B7C8D9E0F1A2B,2.0-fix5';
+    if (k === '*IDN') return 'ALIENTEK,ATK-PTLT1,1C2D3E4F5A6B7C8D9E0F1A2B,2.3-fix5';
     if (k === 'SYST:ERR') return '0,"No error"';
     if (k === 'LCR:MODE') { if (q) return this.mode; this.mode = arg; return null; }
     if (k === 'LCR:FREQ') { if (q) return String(this.f); this.f = num; return null; }
@@ -979,6 +1132,45 @@ class SimLT1 extends SimBase {
     if (k === 'SWE:STAT') { this.sweepTick(); return `${this.sw.run},${this.sw.done}`; }
     if (k === 'SWE:DATA') { this.sweepTick(); return block(new Uint8Array(this.sw.data.buffer, 0, this.sw.done * 12)); }
     return q ? '' : null;
+  }
+}
+
+/* ---------- C2: транспорт-симулятор с бинарными кадрами EE ----------
+   Отвечает теми же кадрами, что прошивка 2.5.0, и пропускает их через C2Frame,
+   так что в демо работают разбор, C2Link и драйвер целиком. */
+class SimC2 extends Emitter {
+  constructor(model = 'ATK-C2 Pro') {
+    super(); this.kind = 'sim'; this.proto = 'c2'; this.name = 'Демо'; this.model = model;
+    this.parser = new C2Frame(); this.t0 = performance.now(); this.pdo = 9000;
+  }
+  async open() { } async close() { } abort() { this.parser.flush(); }
+  async send(b) {
+    b = toBytes(b);
+    if (b[0] !== 0xEE || b.length < 4 || b[3 + b[2]] !== C2P.cksum(b, 3 + b[2])) return;   // прибор молча игнорирует битый кадр
+    const r = b[1] === 1 ? this.info() : b[1] === 22 ? this.record() : null;
+    if (r) setTimeout(() => this.parser.feed(r), 2);
+  }
+  recv(timeout = 3000) { return this.parser.next(timeout); }
+  info() {
+    const p = new Uint8Array(30);
+    p[0] = 1; p[1] = 2; p[2] = 50;                                   // аппаратная 1, прошивка 2.5.0
+    const v = new DataView(p.buffer); v.setUint32(7, 0x1C2D3E4F, true); v.setUint32(11, 0x5A6B7C8D, true);
+    p.set(enc.encode(this.model).subarray(0, 12), 15);
+    p[28] = this.model === 'ATK-C2 Lite' ? 1 : 0;
+    return C2P.reply(1, p);
+  }
+  record() {
+    const s = (performance.now() - this.t0) / 1000;
+    const step = [5000, 9000, 12000, 15000, 20000][Math.floor(s / 12) % 5];   // переговоры PD: 5, 9, 12, 15, 20 В
+    this.pdo += (step - this.pdo) * 0.25;
+    const ma = Math.max(0, 1500 + 900 * Math.sin(s * 0.7) + rnd(25));
+    const p = new Uint8Array(51), v = new DataView(p.buffer);
+    p[2] = 1;
+    v.setUint32(3, Math.round(this.pdo - ma * 0.03 + rnd(4)), true);     // мВ, просадка под нагрузкой
+    v.setUint32(7, Math.round(ma), true);                                // мА
+    v.setUint32(11, Math.round(600 + rnd(8)), true);                     // D+ мВ
+    v.setUint32(15, Math.round(Math.max(0, 8 + rnd(6))), true);          // D− мВ
+    return C2P.reply(22, p);
   }
 }
 
@@ -1220,6 +1412,8 @@ const LT1_LEV = [0.1, 0.3, 0.6, 1.0];
 class LT1 extends Device {
   static probe(idn) { return /PTLT1|LT1/i.test(idn); }
   id = 'lt1'; title = 'LT1';
+  // fix5 2.3 and later: the fifth frequency is 50 kHz (100 kHz before)
+  get freqs() { const m = /(\d+)\.(\d+)-fix5/.exec(this.fw); const v = m ? +m[1] * 10 + +m[2] : 23; return [100, 120, 1000, 10000, v >= 23 ? 50000 : 100000]; }
   async start() {
     const c = this.s;
     Object.assign(c, { pollMs: store.get('lt1.poll', 33), mode: 'AUTO', freq: 1000, lev: .6, circ: 0, aver: 2, hold: 0, ah: 0, seq: -1, type: 0, vg: 1, ig: 1000, rate: 0, swRun: 0, swDone: 0, swSpeed: 1, sweep: null });
@@ -1297,6 +1491,67 @@ class LT1 extends Device {
   windows() { return ['lt1-lcr', 'reading', 'lt1-sweep', 'settings']; }
 }
 
+/* ---------- ALIENTEK C2 (Lite, Std, Pro: одна прошивка, модель в настройках) ----------
+   Протокол бинарный (C2Link), см. C2_PROTOCOL.md. Команда 1: сведения о приборе,
+   команда 22: запись измерения. Драйвер только читает: команды записи и вход в
+   обновление (15) сюда намеренно не включены. */
+const C2_FIELDS = [            // [ключ, имя, единица, масштаб сырого u32]; масштаб предварительный
+  ['vbus', 'Напряжение VBUS', 'V', 1e-3],
+  ['ibus', 'Ток VBUS', 'A', 1e-3],
+  ['dp', 'Напряжение D+', 'V', 1e-3],
+  ['dn', 'Напряжение D−', 'V', 1e-3],
+];
+
+function c2Info(p) {
+  if (!p || p.length < 27) return null;
+  let model = '';
+  for (let i = 15; i < 27 && p[i]; i++) model += String.fromCharCode(p[i]);
+  const u32 = o => (p[o] | p[o + 1] << 8 | p[o + 2] << 16 | p[o + 3] << 24) >>> 0;
+  const serial = u32(7).toString(16).padStart(8, '0') + u32(11).toString(16).padStart(8, '0');
+  return { model: model.trim() || 'ATK-C2', fw: `${p[1]}.${(p[2] / 10) | 0}.${p[2] % 10}`, hw: p[0], lite: p[28] === 1, serial: serial.toUpperCase() };
+}
+
+class C2 extends Device {
+  id = 'c2'; title = 'C2';
+  constructor(link, info) {
+    super(link, `ALIENTEK,${info.model},${info.serial},${info.fw}`);
+    this.info = info;
+    this.title = info.model.replace(/^ATK-/, '') || 'C2';
+  }
+  async start() {
+    const c = this.s;
+    Object.assign(c, { pollMs: store.get('c2.poll', 50), rate: 0, frames: 0, bad: 0 });
+    for (const [k, name, unit] of C2_FIELDS) Hub.define({ id: 'c2.' + k, name, unit, dev: this.id, group: 'C2', digits: 5 });
+    Hub.define({ id: 'c2.p', name: 'Мощность', unit: 'W', dev: this.id, group: 'C2', digits: 5 });
+    this.alive = true;
+    this.offFrame = this.link.on('frame', f => this.onFrame(f));
+    this.loop();
+  }
+  onFrame(f) {
+    if (f.cmd !== 22 || f.payload.length < 19) return;
+    const p = f.payload, v = new DataView(p.buffer, p.byteOffset, p.byteLength), o = {};
+    C2_FIELDS.forEach(([k, , , sc], i) => { o[k] = v.getUint32(3 + i * 4, true) * sc; Hub.push('c2.' + k, o[k]); });
+    Hub.push('c2.p', o.vbus * o.ibus);
+    this.s.frames++;
+    if (this.state !== 'ok') { this.state = 'ok'; this.emit('state'); }
+  }
+  async loop() {
+    const c = this.s; let last = performance.now(), base = 0;
+    while (this.alive) {
+      const t0 = performance.now();
+      try { await this.link.send(22, [0]); }
+      catch (e) { if (!this.alive) return; this.fail(e); await sleep(400); }
+      if (t0 - last >= 1000) {
+        c.rate = (c.frames - base) / ((t0 - last) / 1000); base = c.frames; last = t0;
+        c.bad = this.link.tr.parser?.bad ?? 0; this.emit('rate');
+      }
+      await sleep(Math.max(0, c.pollMs - (performance.now() - t0)));
+    }
+  }
+  async stop() { this.alive = false; this.offFrame?.(); try { await this.link.close(); } catch { } Hub.removeDev(this.id); }
+  windows() { return ['reading', 'table', 'trend']; }
+}
+
 /* ---------- любой SCPI-прибор ---------- */
 class GenericScpi extends Device {
   static probe() { return true; }
@@ -1322,6 +1577,7 @@ const Devices = new (class extends Emitter {
   list = [];
   get(id) { return this.list.find(d => d.id === id); }
   async attach(tr) {
+    if (tr.proto === 'c2') return this.attachC2(tr);
     await tr.open();
     const link = new Link(tr);
     let idn, sa = null;
@@ -1338,6 +1594,22 @@ const Devices = new (class extends Emitter {
     const Cls = sa ? TinySA : [DM40, LT1].find(c => c.probe(idn)) || GenericScpi;
     const dev = new Cls(link, sa ? sa.idn : idn);
     if (sa) { dev.p = sa.p; dev.info = sa.info; }
+    const same = this.get(dev.id);
+    if (same) await this.remove(same);
+    await dev.start();
+    this.list.push(dev);
+    this.emit('change');
+    return dev;
+  }
+  async attachC2(tr) {
+    if (!(tr.parser instanceof C2Frame)) tr.parser = new C2Frame();   // BLE, SPP, мост: кадры EE вместо строк SCPI
+    await tr.open();
+    const link = new C2Link(tr);
+    link.start();
+    let info = null;
+    for (let i = 0; i < 3 && !info; i++) info = c2Info(await link.request(1, [], { timeout: 1500 }).catch(() => null));
+    if (!info) { await link.close(); throw new Error('C2 не ответил на запрос сведений. Проверьте кабель или Bluetooth и что прибор включён.'); }
+    const dev = new C2(link, info);
     const same = this.get(dev.id);
     if (same) await this.remove(same);
     await dev.start();
@@ -3105,7 +3377,7 @@ WM.define('lt1-lcr', {
     const num = h('div', { class: 'digits' }), unit = h('div', { class: 'unit' }), kind = h('b'), meta = h('span'), secBox = h('div', { class: 'tiles small' });
     const ALL = [['z', '|Z|'], ['r', 'R'], ['x', 'X'], ['theta', 'θ'], ['d', 'D'], ['q', 'Q'], ['c', 'C'], ['l', 'L'], ['rp', 'Rp'], ['cp', 'Cp'], ['lp', 'Lp'], ['y', '|Y|']];
     const mode = seg([['AUTO', 'Авто'], ['R', 'R'], ['C', 'C'], ['L', 'L'], ['D', 'Диод']], c.mode, v => dev.set('mode', 'LCR:MODE', v).catch(errToast), 'Режим');
-    const freq = seg(LT1_FREQ.map(f => [f, fmtSI(f, 'Hz', 3).replace('.00', '').replace('.0 ', ' ')]), c.freq, v => dev.set('freq', 'LCR:FREQ', +v).then(() => sleep(30)).then(() => dev.readState()).catch(errToast), 'Частота');
+    const freq = seg(dev.freqs.map(f => [f, fmtSI(f, 'Hz', 3).replace('.00', '').replace('.0 ', ' ')]), c.freq, v => dev.set('freq', 'LCR:FREQ', +v).then(() => sleep(30)).then(() => dev.readState()).catch(errToast), 'Частота');
     const lev = seg(LT1_LEV.map(l => [l, l.toFixed(1).replace('.', ',') + ' В']), c.lev, v => dev.set('lev', 'LCR:LEV', +v).catch(errToast), 'Уровень');
     const circ = seg([[0, 'Послед.'], [1, 'Парал.'], [2, 'Обе']], c.circ, v => dev.set('circ', 'LCR:CIRC', +v).catch(errToast), 'Схема');
     const aver = seg([[0, 'Выкл'], [1, 'Слабое'], [2, 'Среднее'], [3, 'Сильное']], c.aver, v => dev.set('aver', 'LCR:AVER', +v).catch(errToast), 'Усреднение');
@@ -3129,7 +3401,7 @@ WM.define('lt1-lcr', {
     tiles();
     function ui() {
       mode.set(c.mode); freq.set(c.freq); lev.set(c.lev); circ.set(c.circ); aver.set(c.aver); ah.set(c.ah); hold.set(!!c.hold);
-      const b = lev.btns.find(x => x.dataset.v === '1'); if (b) { b.disabled = c.freq === 100000; b.title = c.freq === 100000 ? 'На 100 кГц выход ограничен примерно 0,57 В' : ''; }
+      const b = lev.btns.find(x => x.dataset.v === '1'); if (b) { const top = c.freq === dev.freqs[4]; b.disabled = top; b.title = top ? `На ${dev.freqs[4] / 1000} кГц уровень 1 В недоступен` : ''; }
     }
     ui(); win.sub(dev, 'lcr', ui);
     win.sub(dev, 'rate', () => { info.textContent = `${c.rate.toFixed(1)} изм/с · усиления ${c.vg} / ${c.ig}`; });
@@ -3188,7 +3460,7 @@ WM.define('lt1-sweep', {
     }
     box.addEventListener('pointermove', e => { const r = box.getBoundingClientRect(); hover = { x: e.clientX - r.left, y: e.clientY - r.top }; dirty = true; });
     box.addEventListener('pointerleave', () => { hover = null; tip.hidden = true; dirty = true; });
-    const F0 = 100, F1 = 100000;
+    const F0 = 100;                     // 2.2 sweeps to 50 kHz, older firmware to 100 kHz: the axis follows the data
     function lane(g, s, r, k, y0, H, L, W, col, X) {
       const q = SW_Q.find(x => x[0] === k), vals = []; for (let i = 0; i < s.n; i++) vals.push(val(s, i, k));
       const fin = vals.filter(v => Number.isFinite(v));
@@ -3216,7 +3488,7 @@ WM.define('lt1-sweep', {
     function draw() {
       const g = p.g, W = p.w, H = p.h, col = Theme.colors, L = 66, B = 22, gap = 10, s = c.sweep; g.clearRect(0, 0, W, H);
       if (!s || !s.n) { g.fillStyle = col.ink3; g.font = FONT(12); g.fillText('Подключите деталь и нажмите «Снять 100 точек»', L, 30); return; }
-      const X = f => L + Math.log10(f / F0) / Math.log10(F1 / F0) * (W - L - 12), laneH = (H - B - gap) / 2;
+      const F1 = s.f[s.n - 1] > 50001 ? 100000 : 50000, X = f => L + Math.log10(f / F0) / Math.log10(F1 / F0) * (W - L - 12), laneH = (H - B - gap) / 2;
       g.font = FONT(10);
       for (const t of logTicks(F0, F1)) { const x = X(t.v); g.strokeStyle = col.grid; g.beginPath(); g.moveTo(x + .5, 0); g.lineTo(x + .5, H - B); g.stroke(); g.fillStyle = col.ink3; g.textAlign = 'center'; if (t.major || W > 620) g.fillText(fmtSI(t.v, 'Hz', 2).replace('.0 ', ' '), x, H - 7); }
       const a = lane(g, s, ref, cfg.top, 0, laneH, L, W, col, X), b = lane(g, s, ref, cfg.bot, laneH + gap, laneH, L, W, col, X);
@@ -3722,6 +3994,11 @@ const DEFAULT_LAYOUT = () => [
     { type: 'sa-screen', cfg: {}, g: { x: 912, y: 16, w: 560, h: 384 } },
     { type: 'sa-settings', cfg: {}, g: { x: 912, y: 416, w: 560, h: 296 } },
   ] },
+  { name: 'C2', wins: [
+    { type: 'reading', cfg: { q: 'c2.p', digits: 5 }, g: { x: 16, y: 16, w: 400, h: 208 } },
+    { type: 'table', cfg: { ids: ['c2.vbus', 'c2.ibus', 'c2.p', 'c2.dp', 'c2.dn'] }, g: { x: 432, y: 16, w: 568, h: 208 } },
+    { type: 'trend', cfg: { ids: ['c2.vbus', 'c2.ibus'], span: 60 }, g: { x: 16, y: 240, w: 984, h: 360 } },
+  ] },
   { name: 'Данные', wins: [
     { type: 'recorder', cfg: {}, g: { x: 16, y: 16, w: 384, h: 344 } },
     { type: 'console', cfg: {}, g: { x: 416, y: 16, w: 560, h: 344 } },
@@ -3761,13 +4038,16 @@ const App = {
         card(UsbTmc.available, 'USB-кабель', 'USBTMC: LT1, DM40 и другие SCPI-приборы. Самая высокая скорость.', () => UsbTmc.pick()),
         card(SerialLink.available, 'COM-порт и Bluetooth SPP', 'tinySA по USB (виртуальный COM-порт). DM40 по классическому Bluetooth: сначала сопрягите его в системе. Подходит и для адаптеров USB-UART.', () => SerialLink.pick(+baud.value)),
         card(BleLink.available, 'Bluetooth LE', 'Прямое подключение без сопряжения. Канал обмена ищется автоматически.', () => BleLink.pick()),
+        card(UsbVendor.available, 'C2 по USB', 'ALIENTEK C2 Lite, Std, Pro. Bulk 64 байта с непрерывным чтением: самая высокая скорость. Драйвер WinUSB Windows ставит сама.', () => UsbVendor.pick()),
+        card(BleLink.available, 'C2 по Bluetooth LE', 'C2 Std и Pro без сопряжения. В C2 Lite Bluetooth нет.', async () => { const t = await BleLink.pick(); t.proto = 'c2'; return t; }),
+        card(SerialLink.available, 'C2 через COM или SPP', 'Классический Bluetooth C2 после сопряжения в системе или адаптер USB-UART.', async () => { const t = await SerialLink.pick(+baud.value); t.proto = 'c2'; return t; }),
         h('button', { class: 'card', onclick: () => { d.close(); store.set('wsUrl', wsUrl.value); this.connect(async () => new WsLink(wsUrl.value)); } }, h('b', { text: 'Мост WebSocket' }), h('small', { text: 'Для Firefox и Safari: прибор подключается через bridge.py.' })),
-        h('button', { class: 'card', onclick: () => { d.close(); this.startDemo(); } }, h('b', { text: 'Демо' }), h('small', { text: 'Симуляторы LT1, DM40 и tinySA со случайными данными.' }))),
+        h('button', { class: 'card', onclick: () => { d.close(); this.startDemo(); } }, h('b', { text: 'Демо' }), h('small', { text: 'Симуляторы LT1, DM40, tinySA и C2 со случайными данными.' }))),
       h('div', { class: 'row wrap' }, field('Скорость COM-порта', baud), field('Адрес моста', wsUrl)),
       h('details', {}, h('summary', { text: 'DM40 не появляется в списке USB (Windows)' }),
         h('p', { text: 'Windows не содержит драйвера USBTMC, поэтому браузер не может открыть этот интерфейс. Сборка opendm40 с поддержкой этой программы подключает WinUSB сама. На более старых сборках установите WinUSB один раз через Zadig: Options > List All Devices, выберите интерфейс USBTMC устройства DM40 (не mass storage), WinUSB, Install Driver. Диск при этом продолжит работать.' })),
       h('details', {}, h('summary', { text: 'Какие браузеры подходят' }),
-        h('p', { text: 'USB, COM-порт и Bluetooth работают в Chrome, Edge и Opera на Windows, macOS, Linux и ChromeOS. На Android работают USB и Bluetooth LE. Firefox и Safari этих функций не имеют, для них есть мост. В Linux для USB нужно правило udev для 1209:d040.' })));
+        h('p', { text: 'USB, COM-порт и Bluetooth работают в Chrome, Edge и Opera на Windows, macOS, Linux и ChromeOS. На Android работают USB и Bluetooth LE. Firefox и Safari этих функций не имеют, для них есть мост. В Linux для USB нужно правило udev для 1209:d040, 2e3c:5721 и 2e88:c2c2 (C2).' })));
     const d = this.dlg('Подключить прибор', body);
   },
   windowsDialog() {
@@ -3823,6 +4103,7 @@ const App = {
       await Devices.attach(tr).catch(e => toast(e.message, 'bad'));
     }
     await Devices.attach(new SimSaLink()).catch(e => toast(e.message, 'bad'));
+    await Devices.attach(new SimC2()).catch(e => toast(e.message, 'bad'));
   },
   addCalc(c, keep) {
     const q = Hub.define({ id: c.id, name: c.name, unit: c.unit, dev: 'calc', group: 'Формулы', digits: 5 });
@@ -3843,8 +4124,9 @@ const App = {
   },
   async autoReconnect() {
     try {
-      for (const d of (await navigator.usb?.getDevices()) || []) await this.connect(async () => new UsbTmc(d));
-      navigator.usb?.addEventListener('connect', e => this.connect(async () => new UsbTmc(e.device)));
+      const pick = d => UsbVendor.match(d) ? new UsbVendor(d) : new UsbTmc(d);
+      for (const d of (await navigator.usb?.getDevices()) || []) await this.connect(async () => pick(d));
+      navigator.usb?.addEventListener('connect', e => this.connect(async () => pick(e.device)));
       navigator.usb?.addEventListener('disconnect', e => { const d = Devices.list.find(x => x.link.tr.dev === e.device); if (d) { toast(`${d.title}: кабель отключён`, 'warn'); Devices.remove(d); } });
     } catch { }
   },

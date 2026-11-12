@@ -207,7 +207,8 @@ class SimLT1 extends SimBase {
     const per = [260, 110, 45][s.speed] ?? 110;
     const want = Math.min(100, Math.floor((performance.now() - s.t0) / per));
     while (s.done < want) {
-      const i = s.done++, f = 100 * 1000 ** (i / 99), [re, im] = this.z(f), n = Math.hypot(re, im) * 8e-4 / (s.speed + 1) * (3 - s.speed);
+      // the 2.2 grid: 1 kHz exactly at point 34, 50 kHz last
+      const i = s.done++, f = i <= 34 ? 100 * 10 ** (i / 34) : 1000 * 50 ** ((i - 34) / 65), [re, im] = this.z(f), n = Math.hypot(re, im) * 8e-4 / (s.speed + 1) * (3 - s.speed);
       s.data[i * 3] = f; s.data[i * 3 + 1] = re + rnd(n); s.data[i * 3 + 2] = im + rnd(n);
     }
     if (s.done >= 100) s.run = 0;
@@ -215,7 +216,7 @@ class SimLT1 extends SimBase {
   cmd(c) {
     const m = c.match(/^:?(\S+)\s*(.*)$/); if (!m) return null;
     const hd = m[1].toUpperCase(), arg = m[2].trim().toUpperCase(), q = hd.endsWith('?'), k = hd.replace(/\?$/, ''), num = parseFloat(arg);
-    if (k === '*IDN') return 'ALIENTEK,ATK-PTLT1,1C2D3E4F5A6B7C8D9E0F1A2B,2.0-fix5';
+    if (k === '*IDN') return 'ALIENTEK,ATK-PTLT1,1C2D3E4F5A6B7C8D9E0F1A2B,2.3-fix5';
     if (k === 'SYST:ERR') return '0,"No error"';
     if (k === 'LCR:MODE') { if (q) return this.mode; this.mode = arg; return null; }
     if (k === 'LCR:FREQ') { if (q) return String(this.f); this.f = num; return null; }
@@ -231,5 +232,44 @@ class SimLT1 extends SimBase {
     if (k === 'SWE:STAT') { this.sweepTick(); return `${this.sw.run},${this.sw.done}`; }
     if (k === 'SWE:DATA') { this.sweepTick(); return block(new Uint8Array(this.sw.data.buffer, 0, this.sw.done * 12)); }
     return q ? '' : null;
+  }
+}
+
+/* ---------- C2: транспорт-симулятор с бинарными кадрами EE ----------
+   Отвечает теми же кадрами, что прошивка 2.5.0, и пропускает их через C2Frame,
+   так что в демо работают разбор, C2Link и драйвер целиком. */
+class SimC2 extends Emitter {
+  constructor(model = 'ATK-C2 Pro') {
+    super(); this.kind = 'sim'; this.proto = 'c2'; this.name = 'Демо'; this.model = model;
+    this.parser = new C2Frame(); this.t0 = performance.now(); this.pdo = 9000;
+  }
+  async open() { } async close() { } abort() { this.parser.flush(); }
+  async send(b) {
+    b = toBytes(b);
+    if (b[0] !== 0xEE || b.length < 4 || b[3 + b[2]] !== C2P.cksum(b, 3 + b[2])) return;   // прибор молча игнорирует битый кадр
+    const r = b[1] === 1 ? this.info() : b[1] === 22 ? this.record() : null;
+    if (r) setTimeout(() => this.parser.feed(r), 2);
+  }
+  recv(timeout = 3000) { return this.parser.next(timeout); }
+  info() {
+    const p = new Uint8Array(30);
+    p[0] = 1; p[1] = 2; p[2] = 50;                                   // аппаратная 1, прошивка 2.5.0
+    const v = new DataView(p.buffer); v.setUint32(7, 0x1C2D3E4F, true); v.setUint32(11, 0x5A6B7C8D, true);
+    p.set(enc.encode(this.model).subarray(0, 12), 15);
+    p[28] = this.model === 'ATK-C2 Lite' ? 1 : 0;
+    return C2P.reply(1, p);
+  }
+  record() {
+    const s = (performance.now() - this.t0) / 1000;
+    const step = [5000, 9000, 12000, 15000, 20000][Math.floor(s / 12) % 5];   // переговоры PD: 5, 9, 12, 15, 20 В
+    this.pdo += (step - this.pdo) * 0.25;
+    const ma = Math.max(0, 1500 + 900 * Math.sin(s * 0.7) + rnd(25));
+    const p = new Uint8Array(51), v = new DataView(p.buffer);
+    p[2] = 1;
+    v.setUint32(3, Math.round(this.pdo - ma * 0.03 + rnd(4)), true);     // мВ, просадка под нагрузкой
+    v.setUint32(7, Math.round(ma), true);                                // мА
+    v.setUint32(11, Math.round(600 + rnd(8)), true);                     // D+ мВ
+    v.setUint32(15, Math.round(Math.max(0, 8 + rnd(6))), true);          // D− мВ
+    return C2P.reply(22, p);
   }
 }

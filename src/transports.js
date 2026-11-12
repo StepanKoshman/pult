@@ -14,7 +14,7 @@ class UsbTmc extends Emitter {
   static get available() { return !!navigator.usb; }
   static filters = [
     { vendorId: 0x1209, productId: 0xD040 },       // DM40 с opendm40
-    { vendorId: 0x2E3C, productId: 0x5721 },       // LT1 с прошивкой fix5 (2.0)
+    { vendorId: 0x2E3C, productId: 0x5721 },       // LT1 с прошивкой fix5 (2.0 и новее)
     { classCode: 0xFE, subclassCode: 3 },          // любой USBTMC-прибор
   ];
   constructor(device) { super(); this.dev = device; this.tag = 1; this.kind = 'usb'; this.name = device?.productName || 'USB'; }
@@ -210,7 +210,7 @@ class BleLink extends Emitter {
   constructor(device) { super(); this.dev = device; this.parser = new StreamParser(); this.kind = 'bt'; this.name = device?.name || 'BLE'; this.mtu = 20; }
   static async pick() {
     return new BleLink(await navigator.bluetooth.requestDevice({
-      filters: [{ namePrefix: 'DM40' }, { namePrefix: 'C-1-ATK' }, { namePrefix: 'LT1' }, { namePrefix: 'ATK' }],
+      filters: [{ namePrefix: 'DM40' }, { namePrefix: 'C-1-ATK' }, { namePrefix: 'LT1' }, { namePrefix: 'ATK' }, { namePrefix: 'C2' }],
       optionalServices: BLE_SERVICES,
     }));
   }
@@ -314,4 +314,156 @@ function parseBlock(b) {
   if (d <= 0) return new Uint8Array(0);
   const size = parseInt(dec.decode(b.subarray(2, 2 + d)), 10);
   return b.subarray(2 + d, 2 + d + size);
+}
+
+/* ======================= ALIENTEK C2: бинарный протокол EE =======================
+   Не SCPI. Кадр в обе стороны: EE cmd len payload[len] ck, в ответе ещё хвост FF.
+   ck = (-сумма байт от EE до конца payload) & 0xFF. По USB каждый кадр в своём
+   пакете 64 байта, по Bluetooth кадры идут потоком, поэтому режем по EE и len. */
+const C2P = {
+  cksum(b, n) { let s = 0; for (let i = 0; i < n; i++) s += b[i]; return (-s) & 0xFF; },
+  frame(cmd, payload = []) {
+    const p = payload instanceof Uint8Array ? payload : Uint8Array.from(payload);
+    const f = new Uint8Array(4 + p.length);
+    f[0] = 0xEE; f[1] = cmd & 0xFF; f[2] = p.length; f.set(p, 3);
+    f[3 + p.length] = C2P.cksum(f, 3 + p.length);
+    return f;
+  },
+  reply(cmd, payload) { const f = C2P.frame(cmd, payload), o = new Uint8Array(f.length + 1); o.set(f); o[f.length] = 0xFF; return o; },
+};
+const c2hex = u => Array.from(u, b => b.toString(16).padStart(2, '0')).join(' ');
+
+/* Поток байт -> кадры EE. Интерфейс как у StreamParser: feed, flush, next. */
+class C2Frame {
+  constructor() { this.buf = new Uint8Array(1 << 12); this.len = 0; this.wait = null; this.bad = 0; }
+  feed(u) {
+    if (this.len + u.length > this.buf.length) {
+      const n = new Uint8Array(Math.max(this.buf.length * 2, this.len + u.length)); n.set(this.buf.subarray(0, this.len)); this.buf = n;
+    }
+    this.buf.set(u, this.len); this.len += u.length;
+    if (this.wait) { const w = this.wait; this.wait = null; w(); }
+  }
+  flush() { this.len = 0; }
+  drop(k) { this.buf.copyWithin(0, k, this.len); this.len -= k; }
+  take() {
+    for (; ;) {
+      let i = 0;
+      while (i < this.len && this.buf[i] !== 0xEE) i++;   // ресинхронизация и паддинг USB-пакета
+      if (i) this.drop(i);
+      if (this.len < 4) return null;
+      const L = this.buf[2], cmd = this.buf[1], need = 4 + L;
+      if (L > 59 || cmd < 1 || cmd > 0x20) { this.bad++; this.drop(1); continue; }   // кадр C2 всегда помещается в 64 байта
+      if (this.len < need) return null;
+      if (this.buf[3 + L] !== C2P.cksum(this.buf, 3 + L)) { this.bad++; this.drop(1); continue; }
+      const out = this.buf.slice(0, need);
+      this.drop(this.len > need && this.buf[need] === 0xFF ? need + 1 : need);
+      return out;
+    }
+  }
+  async next(timeout) {
+    const end = performance.now() + timeout;
+    for (; ;) {
+      const m = this.take();
+      if (m) return m;
+      const left = end - performance.now();
+      if (left <= 0) throw new TimeoutError();
+      await new Promise(r => { const id = setTimeout(() => { this.wait = null; r(); }, left); this.wait = () => { clearTimeout(id); r(); }; });
+    }
+  }
+}
+
+/* WebUSB, вендорный интерфейс C2 (bulk OUT 0x01, IN 0x82, 64 байта, Full-Speed).
+   Чтение идёт непрерывно и не ждёт запросов: так поток измерений не упирается в
+   пинг-понг и шина работает на пределе Full-Speed. */
+class UsbVendor extends Emitter {
+  static label = 'USB';
+  static get available() { return !!navigator.usb; }
+  static filters = [{ vendorId: 0x2E88, productId: 0xC2C2 }, { vendorId: 0x2E88 }];
+  static match(d) { return d?.vendorId === 0x2E88; }
+  constructor(device) { super(); this.dev = device; this.kind = 'usb'; this.proto = 'c2'; this.name = device?.productName || 'USB'; this.parser = new C2Frame(); this.rxBytes = 0; }
+  static async pick() { return new UsbVendor(await navigator.usb.requestDevice({ filters: UsbVendor.filters })); }
+  findIface() {
+    for (const cfg of this.dev.configurations) for (const i of cfg.interfaces) for (const a of i.alternates) {
+      let bi = 0, bo = 0, mps = 64;
+      for (const e of a.endpoints) {
+        if (e.type !== 'bulk') continue;
+        if (e.direction === 'in') { bi = e.endpointNumber; mps = e.packetSize || 64; } else bo = e.endpointNumber;
+      }
+      if (a.interfaceClass === 0xFF && bi && bo) return { cfg, iface: i, alt: a, bi, bo, mps };
+    }
+    return null;
+  }
+  async open() {
+    const d = this.dev;
+    await d.open();
+    if (!d.configuration) await d.selectConfiguration(d.configurations[0].configurationValue);
+    const f = this.findIface();
+    if (!f) throw new Error('У устройства нет вендорного интерфейса C2');
+    if (d.configuration.configurationValue !== f.cfg.configurationValue) await d.selectConfiguration(f.cfg.configurationValue);
+    this.ifn = f.iface.interfaceNumber;
+    await d.claimInterface(this.ifn);
+    if (f.alt.alternateSetting) await d.selectAlternateInterface(this.ifn, f.alt.alternateSetting);
+    this.epIn = f.bi; this.epOut = f.bo; this.mps = f.mps;
+    await d.clearHalt('in', this.epIn).catch(() => { });
+    await d.clearHalt('out', this.epOut).catch(() => { });
+    this.alive = true;
+    this.pump();
+  }
+  async pump() {
+    while (this.alive) {
+      let r;
+      try { r = await this.dev.transferIn(this.epIn, this.mps); }
+      catch (e) { if (this.alive) this.emit('lost', e); return; }
+      if (r.status === 'stall') { await this.dev.clearHalt('in', this.epIn).catch(() => { }); continue; }
+      if (r.status === 'babble') continue;
+      if (r.status !== 'ok') { if (this.alive) this.emit('lost', new Error('USB: ' + r.status)); return; }
+      if (r.data?.byteLength) { this.rxBytes += r.data.byteLength; this.parser.feed(new Uint8Array(r.data.buffer, r.data.byteOffset, r.data.byteLength)); }
+    }
+  }
+  async close() { this.alive = false; try { await this.dev.releaseInterface(this.ifn); } catch { } try { await this.dev.close(); } catch { } }
+  async send(data) { const r = await this.dev.transferOut(this.epOut, toBytes(data)); if (r.status === 'stall') { await this.dev.clearHalt('out', this.epOut).catch(() => { }); throw new Error('USB: stall'); } }
+  recv(timeout = 3000) { return this.parser.next(timeout); }
+  abort() { this.parser.flush(); }
+}
+
+/* Канал C2 поверх любого транспорта: одно непрерывное чтение кадров, запросы ждут
+   ответ своей командой, все кадры (и непрошеные, например поток измерений) уходят
+   событием 'frame'. Для BLE, SPP и моста перед open() ставится parser = C2Frame. */
+class C2Link extends Emitter {
+  constructor(tr) {
+    super(); this.tr = tr; this.alive = false; this.wait = new Map(); this.q = Promise.resolve();
+    this.bytes = 0; this.msgs = 0; this.errors = 0; this.log = null;
+    tr.on?.('lost', e => { if (this.alive) this.emit('lost', e); });
+  }
+  start() { if (this.alive) return; this.alive = true; this.loop(); }
+  async loop() {
+    while (this.alive) {
+      let f;
+      try { f = await this.tr.recv(1000); }
+      catch (e) { if (e instanceof TimeoutError) continue; if (this.alive) { this.errors++; this.emit('lost', e); } return; }
+      this.bytes += f.length; this.msgs++;
+      const cmd = f[1], payload = f.subarray(3, 3 + f[2]);
+      this.log?.('rx', c2hex(f));
+      const w = this.wait.get(cmd);
+      if (w) { this.wait.delete(cmd); clearTimeout(w.timer); w.res(payload); }
+      this.emit('frame', { cmd, payload, raw: f });
+    }
+  }
+  /* Отправки идут строго по очереди, чтобы кадры по Bluetooth не перемешались. */
+  send(cmd, payload = []) {
+    const fr = C2P.frame(cmd, payload);
+    const p = this.q.then(() => { this.log?.('tx', c2hex(fr)); return this.tr.send(fr); });
+    this.q = p.catch(() => { });
+    return p;
+  }
+  request(cmd, payload = [], { timeout = 2000 } = {}) {
+    return new Promise((res, rej) => {
+      const old = this.wait.get(cmd);
+      if (old) { clearTimeout(old.timer); old.rej(new Error('Запрос перекрыт новым')); }
+      const timer = setTimeout(() => { if (this.wait.get(cmd)?.res === res) { this.wait.delete(cmd); this.errors++; rej(new TimeoutError()); } }, timeout);
+      this.wait.set(cmd, { res, rej, timer });
+      this.send(cmd, payload).catch(e => { if (this.wait.get(cmd)?.res === res) { clearTimeout(timer); this.wait.delete(cmd); } this.errors++; rej(e); });
+    });
+  }
+  async close() { this.alive = false; for (const w of this.wait.values()) clearTimeout(w.timer); this.wait.clear(); try { await this.tr.close(); } catch { } }
 }

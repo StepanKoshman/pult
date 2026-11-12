@@ -237,6 +237,8 @@ const LT1_LEV = [0.1, 0.3, 0.6, 1.0];
 class LT1 extends Device {
   static probe(idn) { return /PTLT1|LT1/i.test(idn); }
   id = 'lt1'; title = 'LT1';
+  // fix5 2.3 and later: the fifth frequency is 50 kHz (100 kHz before)
+  get freqs() { const m = /(\d+)\.(\d+)-fix5/.exec(this.fw); const v = m ? +m[1] * 10 + +m[2] : 23; return [100, 120, 1000, 10000, v >= 23 ? 50000 : 100000]; }
   async start() {
     const c = this.s;
     Object.assign(c, { pollMs: store.get('lt1.poll', 33), mode: 'AUTO', freq: 1000, lev: .6, circ: 0, aver: 2, hold: 0, ah: 0, seq: -1, type: 0, vg: 1, ig: 1000, rate: 0, swRun: 0, swDone: 0, swSpeed: 1, sweep: null });
@@ -314,6 +316,67 @@ class LT1 extends Device {
   windows() { return ['lt1-lcr', 'reading', 'lt1-sweep', 'settings']; }
 }
 
+/* ---------- ALIENTEK C2 (Lite, Std, Pro: одна прошивка, модель в настройках) ----------
+   Протокол бинарный (C2Link), см. C2_PROTOCOL.md. Команда 1: сведения о приборе,
+   команда 22: запись измерения. Драйвер только читает: команды записи и вход в
+   обновление (15) сюда намеренно не включены. */
+const C2_FIELDS = [            // [ключ, имя, единица, масштаб сырого u32]; масштаб предварительный
+  ['vbus', 'Напряжение VBUS', 'V', 1e-3],
+  ['ibus', 'Ток VBUS', 'A', 1e-3],
+  ['dp', 'Напряжение D+', 'V', 1e-3],
+  ['dn', 'Напряжение D−', 'V', 1e-3],
+];
+
+function c2Info(p) {
+  if (!p || p.length < 27) return null;
+  let model = '';
+  for (let i = 15; i < 27 && p[i]; i++) model += String.fromCharCode(p[i]);
+  const u32 = o => (p[o] | p[o + 1] << 8 | p[o + 2] << 16 | p[o + 3] << 24) >>> 0;
+  const serial = u32(7).toString(16).padStart(8, '0') + u32(11).toString(16).padStart(8, '0');
+  return { model: model.trim() || 'ATK-C2', fw: `${p[1]}.${(p[2] / 10) | 0}.${p[2] % 10}`, hw: p[0], lite: p[28] === 1, serial: serial.toUpperCase() };
+}
+
+class C2 extends Device {
+  id = 'c2'; title = 'C2';
+  constructor(link, info) {
+    super(link, `ALIENTEK,${info.model},${info.serial},${info.fw}`);
+    this.info = info;
+    this.title = info.model.replace(/^ATK-/, '') || 'C2';
+  }
+  async start() {
+    const c = this.s;
+    Object.assign(c, { pollMs: store.get('c2.poll', 50), rate: 0, frames: 0, bad: 0 });
+    for (const [k, name, unit] of C2_FIELDS) Hub.define({ id: 'c2.' + k, name, unit, dev: this.id, group: 'C2', digits: 5 });
+    Hub.define({ id: 'c2.p', name: 'Мощность', unit: 'W', dev: this.id, group: 'C2', digits: 5 });
+    this.alive = true;
+    this.offFrame = this.link.on('frame', f => this.onFrame(f));
+    this.loop();
+  }
+  onFrame(f) {
+    if (f.cmd !== 22 || f.payload.length < 19) return;
+    const p = f.payload, v = new DataView(p.buffer, p.byteOffset, p.byteLength), o = {};
+    C2_FIELDS.forEach(([k, , , sc], i) => { o[k] = v.getUint32(3 + i * 4, true) * sc; Hub.push('c2.' + k, o[k]); });
+    Hub.push('c2.p', o.vbus * o.ibus);
+    this.s.frames++;
+    if (this.state !== 'ok') { this.state = 'ok'; this.emit('state'); }
+  }
+  async loop() {
+    const c = this.s; let last = performance.now(), base = 0;
+    while (this.alive) {
+      const t0 = performance.now();
+      try { await this.link.send(22, [0]); }
+      catch (e) { if (!this.alive) return; this.fail(e); await sleep(400); }
+      if (t0 - last >= 1000) {
+        c.rate = (c.frames - base) / ((t0 - last) / 1000); base = c.frames; last = t0;
+        c.bad = this.link.tr.parser?.bad ?? 0; this.emit('rate');
+      }
+      await sleep(Math.max(0, c.pollMs - (performance.now() - t0)));
+    }
+  }
+  async stop() { this.alive = false; this.offFrame?.(); try { await this.link.close(); } catch { } Hub.removeDev(this.id); }
+  windows() { return ['reading', 'table', 'trend']; }
+}
+
 /* ---------- любой SCPI-прибор ---------- */
 class GenericScpi extends Device {
   static probe() { return true; }
@@ -339,6 +402,7 @@ const Devices = new (class extends Emitter {
   list = [];
   get(id) { return this.list.find(d => d.id === id); }
   async attach(tr) {
+    if (tr.proto === 'c2') return this.attachC2(tr);
     await tr.open();
     const link = new Link(tr);
     let idn, sa = null;
@@ -355,6 +419,22 @@ const Devices = new (class extends Emitter {
     const Cls = sa ? TinySA : [DM40, LT1].find(c => c.probe(idn)) || GenericScpi;
     const dev = new Cls(link, sa ? sa.idn : idn);
     if (sa) { dev.p = sa.p; dev.info = sa.info; }
+    const same = this.get(dev.id);
+    if (same) await this.remove(same);
+    await dev.start();
+    this.list.push(dev);
+    this.emit('change');
+    return dev;
+  }
+  async attachC2(tr) {
+    if (!(tr.parser instanceof C2Frame)) tr.parser = new C2Frame();   // BLE, SPP, мост: кадры EE вместо строк SCPI
+    await tr.open();
+    const link = new C2Link(tr);
+    link.start();
+    let info = null;
+    for (let i = 0; i < 3 && !info; i++) info = c2Info(await link.request(1, [], { timeout: 1500 }).catch(() => null));
+    if (!info) { await link.close(); throw new Error('C2 не ответил на запрос сведений. Проверьте кабель или Bluetooth и что прибор включён.'); }
+    const dev = new C2(link, info);
     const same = this.get(dev.id);
     if (same) await this.remove(same);
     await dev.start();

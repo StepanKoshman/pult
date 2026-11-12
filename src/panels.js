@@ -612,7 +612,7 @@ WM.define('lt1-lcr', {
     const num = h('div', { class: 'digits' }), unit = h('div', { class: 'unit' }), kind = h('b'), meta = h('span'), secBox = h('div', { class: 'tiles small' });
     const ALL = [['z', '|Z|'], ['r', 'R'], ['x', 'X'], ['theta', 'θ'], ['d', 'D'], ['q', 'Q'], ['c', 'C'], ['l', 'L'], ['rp', 'Rp'], ['cp', 'Cp'], ['lp', 'Lp'], ['y', '|Y|']];
     const mode = seg([['AUTO', 'Авто'], ['R', 'R'], ['C', 'C'], ['L', 'L'], ['D', 'Диод']], c.mode, v => dev.set('mode', 'LCR:MODE', v).catch(errToast), 'Режим');
-    const freq = seg(LT1_FREQ.map(f => [f, fmtSI(f, 'Hz', 3).replace('.00', '').replace('.0 ', ' ')]), c.freq, v => dev.set('freq', 'LCR:FREQ', +v).then(() => sleep(30)).then(() => dev.readState()).catch(errToast), 'Частота');
+    const freq = seg(dev.freqs.map(f => [f, fmtSI(f, 'Hz', 3).replace('.00', '').replace('.0 ', ' ')]), c.freq, v => dev.set('freq', 'LCR:FREQ', +v).then(() => sleep(30)).then(() => dev.readState()).catch(errToast), 'Частота');
     const lev = seg(LT1_LEV.map(l => [l, l.toFixed(1).replace('.', ',') + ' В']), c.lev, v => dev.set('lev', 'LCR:LEV', +v).catch(errToast), 'Уровень');
     const circ = seg([[0, 'Послед.'], [1, 'Парал.'], [2, 'Обе']], c.circ, v => dev.set('circ', 'LCR:CIRC', +v).catch(errToast), 'Схема');
     const aver = seg([[0, 'Выкл'], [1, 'Слабое'], [2, 'Среднее'], [3, 'Сильное']], c.aver, v => dev.set('aver', 'LCR:AVER', +v).catch(errToast), 'Усреднение');
@@ -636,7 +636,7 @@ WM.define('lt1-lcr', {
     tiles();
     function ui() {
       mode.set(c.mode); freq.set(c.freq); lev.set(c.lev); circ.set(c.circ); aver.set(c.aver); ah.set(c.ah); hold.set(!!c.hold);
-      const b = lev.btns.find(x => x.dataset.v === '1'); if (b) { b.disabled = c.freq === 100000; b.title = c.freq === 100000 ? 'На 100 кГц выход ограничен примерно 0,57 В' : ''; }
+      const b = lev.btns.find(x => x.dataset.v === '1'); if (b) { const top = c.freq === dev.freqs[4]; b.disabled = top; b.title = top ? `На ${dev.freqs[4] / 1000} кГц уровень 1 В недоступен` : ''; }
     }
     ui(); win.sub(dev, 'lcr', ui);
     win.sub(dev, 'rate', () => { info.textContent = `${c.rate.toFixed(1)} изм/с · усиления ${c.vg} / ${c.ig}`; });
@@ -695,7 +695,7 @@ WM.define('lt1-sweep', {
     }
     box.addEventListener('pointermove', e => { const r = box.getBoundingClientRect(); hover = { x: e.clientX - r.left, y: e.clientY - r.top }; dirty = true; });
     box.addEventListener('pointerleave', () => { hover = null; tip.hidden = true; dirty = true; });
-    const F0 = 100, F1 = 100000;
+    const F0 = 100;                     // 2.2 sweeps to 50 kHz, older firmware to 100 kHz: the axis follows the data
     function lane(g, s, r, k, y0, H, L, W, col, X) {
       const q = SW_Q.find(x => x[0] === k), vals = []; for (let i = 0; i < s.n; i++) vals.push(val(s, i, k));
       const fin = vals.filter(v => Number.isFinite(v));
@@ -723,7 +723,7 @@ WM.define('lt1-sweep', {
     function draw() {
       const g = p.g, W = p.w, H = p.h, col = Theme.colors, L = 66, B = 22, gap = 10, s = c.sweep; g.clearRect(0, 0, W, H);
       if (!s || !s.n) { g.fillStyle = col.ink3; g.font = FONT(12); g.fillText('Подключите деталь и нажмите «Снять 100 точек»', L, 30); return; }
-      const X = f => L + Math.log10(f / F0) / Math.log10(F1 / F0) * (W - L - 12), laneH = (H - B - gap) / 2;
+      const F1 = s.f[s.n - 1] > 50001 ? 100000 : 50000, X = f => L + Math.log10(f / F0) / Math.log10(F1 / F0) * (W - L - 12), laneH = (H - B - gap) / 2;
       g.font = FONT(10);
       for (const t of logTicks(F0, F1)) { const x = X(t.v); g.strokeStyle = col.grid; g.beginPath(); g.moveTo(x + .5, 0); g.lineTo(x + .5, H - B); g.stroke(); g.fillStyle = col.ink3; g.textAlign = 'center'; if (t.major || W > 620) g.fillText(fmtSI(t.v, 'Hz', 2).replace('.0 ', ' '), x, H - 7); }
       const a = lane(g, s, ref, cfg.top, 0, laneH, L, W, col, X), b = lane(g, s, ref, cfg.bot, laneH + gap, laneH, L, W, col, X);

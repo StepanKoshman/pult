@@ -29,6 +29,11 @@ const DEFAULT_LAYOUT = () => [
     { type: 'sa-screen', cfg: {}, g: { x: 912, y: 16, w: 560, h: 384 } },
     { type: 'sa-settings', cfg: {}, g: { x: 912, y: 416, w: 560, h: 296 } },
   ] },
+  { name: 'C2', wins: [
+    { type: 'reading', cfg: { q: 'c2.p', digits: 5 }, g: { x: 16, y: 16, w: 400, h: 208 } },
+    { type: 'table', cfg: { ids: ['c2.vbus', 'c2.ibus', 'c2.p', 'c2.dp', 'c2.dn'] }, g: { x: 432, y: 16, w: 568, h: 208 } },
+    { type: 'trend', cfg: { ids: ['c2.vbus', 'c2.ibus'], span: 60 }, g: { x: 16, y: 240, w: 984, h: 360 } },
+  ] },
   { name: 'Данные', wins: [
     { type: 'recorder', cfg: {}, g: { x: 16, y: 16, w: 384, h: 344 } },
     { type: 'console', cfg: {}, g: { x: 416, y: 16, w: 560, h: 344 } },
@@ -68,13 +73,16 @@ const App = {
         card(UsbTmc.available, 'USB-кабель', 'USBTMC: LT1, DM40 и другие SCPI-приборы. Самая высокая скорость.', () => UsbTmc.pick()),
         card(SerialLink.available, 'COM-порт и Bluetooth SPP', 'tinySA по USB (виртуальный COM-порт). DM40 по классическому Bluetooth: сначала сопрягите его в системе. Подходит и для адаптеров USB-UART.', () => SerialLink.pick(+baud.value)),
         card(BleLink.available, 'Bluetooth LE', 'Прямое подключение без сопряжения. Канал обмена ищется автоматически.', () => BleLink.pick()),
+        card(UsbVendor.available, 'C2 по USB', 'ALIENTEK C2 Lite, Std, Pro. Bulk 64 байта с непрерывным чтением: самая высокая скорость. Драйвер WinUSB Windows ставит сама.', () => UsbVendor.pick()),
+        card(BleLink.available, 'C2 по Bluetooth LE', 'C2 Std и Pro без сопряжения. В C2 Lite Bluetooth нет.', async () => { const t = await BleLink.pick(); t.proto = 'c2'; return t; }),
+        card(SerialLink.available, 'C2 через COM или SPP', 'Классический Bluetooth C2 после сопряжения в системе или адаптер USB-UART.', async () => { const t = await SerialLink.pick(+baud.value); t.proto = 'c2'; return t; }),
         h('button', { class: 'card', onclick: () => { d.close(); store.set('wsUrl', wsUrl.value); this.connect(async () => new WsLink(wsUrl.value)); } }, h('b', { text: 'Мост WebSocket' }), h('small', { text: 'Для Firefox и Safari: прибор подключается через bridge.py.' })),
-        h('button', { class: 'card', onclick: () => { d.close(); this.startDemo(); } }, h('b', { text: 'Демо' }), h('small', { text: 'Симуляторы LT1, DM40 и tinySA со случайными данными.' }))),
+        h('button', { class: 'card', onclick: () => { d.close(); this.startDemo(); } }, h('b', { text: 'Демо' }), h('small', { text: 'Симуляторы LT1, DM40, tinySA и C2 со случайными данными.' }))),
       h('div', { class: 'row wrap' }, field('Скорость COM-порта', baud), field('Адрес моста', wsUrl)),
       h('details', {}, h('summary', { text: 'DM40 не появляется в списке USB (Windows)' }),
         h('p', { text: 'Windows не содержит драйвера USBTMC, поэтому браузер не может открыть этот интерфейс. Сборка opendm40 с поддержкой этой программы подключает WinUSB сама. На более старых сборках установите WinUSB один раз через Zadig: Options > List All Devices, выберите интерфейс USBTMC устройства DM40 (не mass storage), WinUSB, Install Driver. Диск при этом продолжит работать.' })),
       h('details', {}, h('summary', { text: 'Какие браузеры подходят' }),
-        h('p', { text: 'USB, COM-порт и Bluetooth работают в Chrome, Edge и Opera на Windows, macOS, Linux и ChromeOS. На Android работают USB и Bluetooth LE. Firefox и Safari этих функций не имеют, для них есть мост. В Linux для USB нужно правило udev для 1209:d040.' })));
+        h('p', { text: 'USB, COM-порт и Bluetooth работают в Chrome, Edge и Opera на Windows, macOS, Linux и ChromeOS. На Android работают USB и Bluetooth LE. Firefox и Safari этих функций не имеют, для них есть мост. В Linux для USB нужно правило udev для 1209:d040, 2e3c:5721 и 2e88:c2c2 (C2).' })));
     const d = this.dlg('Подключить прибор', body);
   },
   windowsDialog() {
@@ -130,6 +138,7 @@ const App = {
       await Devices.attach(tr).catch(e => toast(e.message, 'bad'));
     }
     await Devices.attach(new SimSaLink()).catch(e => toast(e.message, 'bad'));
+    await Devices.attach(new SimC2()).catch(e => toast(e.message, 'bad'));
   },
   addCalc(c, keep) {
     const q = Hub.define({ id: c.id, name: c.name, unit: c.unit, dev: 'calc', group: 'Формулы', digits: 5 });
@@ -150,8 +159,9 @@ const App = {
   },
   async autoReconnect() {
     try {
-      for (const d of (await navigator.usb?.getDevices()) || []) await this.connect(async () => new UsbTmc(d));
-      navigator.usb?.addEventListener('connect', e => this.connect(async () => new UsbTmc(e.device)));
+      const pick = d => UsbVendor.match(d) ? new UsbVendor(d) : new UsbTmc(d);
+      for (const d of (await navigator.usb?.getDevices()) || []) await this.connect(async () => pick(d));
+      navigator.usb?.addEventListener('connect', e => this.connect(async () => pick(e.device)));
       navigator.usb?.addEventListener('disconnect', e => { const d = Devices.list.find(x => x.link.tr.dev === e.device); if (d) { toast(`${d.title}: кабель отключён`, 'warn'); Devices.remove(d); } });
     } catch { }
   },
