@@ -1,10 +1,11 @@
-# Выпуск по тегу vX.Y.Z: проверяет, что dist/pult.html собран из src/,
-# и создаёт выпуск с файлами pult.html и bridge.py. Текст выпуска берётся
-# из docs/releases/<тег>.md.
+# Выпуск: пуш в ветку publish/vX.Y.Z (или тег vX.Y.Z) проверяет, что
+# dist/pult.html собран из src/, и создаёт выпуск vX.Y.Z на этом коммите
+# с файлами pult.html и bridge.py. Текст выпуска: docs/releases/<тег>.md.
 name: Release
 on:
   push:
     tags: ['v*']
+    branches: ['publish/v*']
 permissions:
   contents: write
 jobs:
@@ -19,11 +20,12 @@ jobs:
       - name: Создать выпуск
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          REF: ${{ github.ref_name }}
         run: |
+          TAG="${REF#publish/}"
           notes="docs/releases/$TAG.md"
           if [ -f "$notes" ]; then
-            gh release create "$TAG" dist/pult.html dist/bridge.py --title "Пульт ${TAG#v}" --notes-file "$notes"
+            gh release create "$TAG" --target "$GITHUB_SHA" dist/pult.html dist/bridge.py --title "Пульт ${TAG#v}" --notes-file "$notes"
           else
-            gh release create "$TAG" dist/pult.html dist/bridge.py --title "Пульт ${TAG#v}" --generate-notes
+            gh release create "$TAG" --target "$GITHUB_SHA" dist/pult.html dist/bridge.py --title "Пульт ${TAG#v}" --generate-notes
           fi
