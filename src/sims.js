@@ -236,40 +236,147 @@ class SimLT1 extends SimBase {
 }
 
 /* ---------- C2: транспорт-симулятор с бинарными кадрами EE ----------
-   Отвечает теми же кадрами, что прошивка 2.5.0, и пропускает их через C2Frame,
-   так что в демо работают разбор, C2Link и драйвер целиком. */
+   Говорит на родном протоколе прибора (поток 0x04/0x19, триггер 0x05/0x06, прослушка
+   CC 0x0D с настоящими переговорами PD в BMC, e-marker, офлайн-записи) и на командах
+   Пульта 0x1E. Кадры проходят через C2Frame, так что в демо работает весь путь. */
 class SimC2 extends Emitter {
   constructor(model = 'ATK-C2 Pro') {
     super(); this.kind = 'sim'; this.proto = 'c2'; this.name = 'Демо'; this.model = model;
-    this.parser = new C2Frame(); this.t0 = performance.now(); this.pdo = 9000;
+    this.parser = new C2Frame(); this.t0 = performance.now(); this.vset = 5000; this.vnow = 5000; this.ma = 0;
+    this.mode = 2; this.stream = false; this.listen = false; this.trig = null; this.acc = 0; this.last19 = 0; this.lastPd = 0; this.msgId = 0;
+    this.em = [{ valid: 1, vdo: [0x1C0020C2, 0, 0x00010000, 0x00082642] }, { valid: 0, vdo: [0, 0, 0, 0] }];
+    this.avg = 0; this.stage = new Uint8Array(200); this.LOG0 = 0x69c34; this.LOGEND = 0x6a000;
+    this.log = new Uint8Array(this.LOGEND - this.LOG0).fill(0xFF); this.free = 0; this.sc = 0; this.uc = 0;
+    const t = new Uint8Array(96);
+    for (let l = 0; l < 6; l++) for (let i = 0; i < 8; i++) { const w = (300 + 35 * l + 4 * [5, 7, 9, 12, 15, 20, 24, 28][i]) * 10; t[l * 16 + i * 2] = w & 255; t[l * 16 + i * 2 + 1] = w >> 8; }
+    this.append(1, t);
   }
-  async open() { } async close() { } abort() { this.parser.flush(); }
+  async open() { this.timer = setInterval(() => this.tick(), 50); }
+  async close() { clearInterval(this.timer); }
+  abort() { this.parser.flush(); }
+  recv(timeout = 3000) { return this.parser.next(timeout); }
+  out(cmd, p, delay = 3) { const f = C2P.reply(cmd, p); setTimeout(() => this.parser.feed(f), delay); }
+  append(type, body) {
+    const n = 8 + body.length; if (this.free + n > this.log.length) return 0;
+    const r = new Uint8Array(n), v = new DataView(r.buffer); v.setUint32(0, 0x58523243, true); r[4] = type; v.setUint16(6, n, true); r.set(body, 8);
+    this.log.set(r, this.free); const a = this.LOG0 + this.free; this.free += n;
+    if (type === 1) this.sc = a + 8; else this.uc = body[0] | body[1] ? a : 0;
+    return a;
+  }
   async send(b) {
     b = toBytes(b);
     if (b[0] !== 0xEE || b.length < 4 || b[3 + b[2]] !== C2P.cksum(b, 3 + b[2])) return;   // прибор молча игнорирует битый кадр
-    const r = b[1] === 1 ? this.info() : b[1] === 22 ? this.record() : null;
-    if (r) setTimeout(() => this.parser.feed(r), 2);
+    const cmd = b[1], p = b.slice(3, 3 + b[2]);
+    switch (cmd) {
+      case 1: this.out(1, this.info()); break;
+      case 3: this.mode = p[1] % 7; this.out(3, [this.mode > 4 ? 1 : 0, this.mode, 10, 0]); break;
+      case 4: this.stream = p[0] === 1; break;
+      case 5: this.trigger(p); break;
+      case 6: this.trig = null; this.vset = 5000; break;
+      case 8: this.out(8, [1, 0, 0xE8, 3, 0, 0, 23, 0, 0, 0, 23, 0, 0x8F, 0x55, 0xAC, 0x3E, 0x82, 0xF3, 0xE3, 0x3F, 1]); break;
+      case 9: {
+        const n = p[2] | p[3] << 8, all = new Uint8Array(n * 4), v = new DataView(all.buffer);
+        for (let k = 0; k < n; k++) { v.setUint16(k * 4, 5290 + rnd(3) | 0, true); v.setUint16(k * 4 + 2, 50 + 8 * Math.sin(k / 3) | 0, true); }
+        for (let o = 0; o < all.length; o += 56) this.out(9, all.subarray(o, o + 56), 3 + o / 56);
+        break;
+      }
+      case 10: break;
+      case 12:
+        this.listen = p[0] === 1; this.out(12, [p[0], 0, 0xA0, 0x38, 0x39, 0]);
+        if (this.listen) { this.out(0x21, [2, 1, 0, 0, 0, 0, 0, 0, 0, 0], 5); this.lastPd = 0; }
+        break;
+      case 22:
+        this.em.forEach((e, i) => { const r = new Uint8Array(51), v = new DataView(r.buffer); r[0] = 5; r[1] = i; r[2] = e.valid; e.vdo.forEach((w, k) => v.setUint32(3 + k * 4, w >>> 0, true)); this.out(22, r, 3 + i); });
+        break;
+      case 23: { const v = new DataView(p.buffer); this.em[p[1] & 1] = { valid: 1, vdo: [0, 1, 2, 3].map(k => v.getUint32(3 + k * 4, true)) }; this.out(23, [0]); break; }
+      case 24:
+        if (p[1] === 5) this.em.forEach(e => { e.valid = 0; e.vdo = [0, 0, 0, 0]; }); else this.em[p[1] & 1] = { valid: 0, vdo: [0, 0, 0, 0] };
+        this.out(24, [0, p[1]]); break;
+      case 0x1E: this.ext(p); break;
+    }
   }
-  recv(timeout = 3000) { return this.parser.next(timeout); }
+  ext(p) {
+    const sub = p[0], r = new Uint8Array(58), v = new DataView(r.buffer); r[0] = sub;
+    let n = 2;
+    if (sub === 0) {
+      r[2] = 1; r[5] = this.sc ? 1 : 0; r[6] = 8; r[9] = this.avg;
+      v.setUint32(10, this.sc, true); v.setUint32(14, this.uc, true); v.setUint32(18, this.LOG0, true); v.setUint32(22, this.LOG0 + this.free, true); v.setUint32(26, this.LOGEND, true);
+      v.setFloat32(30, this.vnow / 1000 * 1.003, true); v.setFloat32(34, this.ma / 1000 * 0.995, true); r[38] = 3; n = 39;
+    } else if (sub === 1) {
+      const addr = (p[1] | p[2] << 8 | p[3] << 16 | p[4] << 24) >>> 0, len = p[5];
+      v.setUint32(2, addr, true);
+      for (let k = 0; k < len; k++) { const x = addr + k - this.LOG0; r[6 + k] = x >= 0 && x < this.log.length ? this.log[x] : (addr + k) & 255; }
+      n = 6 + len;
+    } else if (sub === 4) this.avg = p[1];
+    else if (sub === 5) this.stage.set(p.subarray(2), Math.max(0, p[1] - 8));
+    else if (sub === 6) { const len = p[2] | p[3] << 8, a = this.append(p[1], this.stage.slice(0, len - 8)); v.setUint32(2, a, true); r[1] = a ? 0 : 3; n = 6; }
+    else r[1] = 0xFF;
+    this.out(0x1E, r.subarray(0, n));
+  }
+  trigger(p) {
+    if (p[0] === 1) {
+      this.trig = p[1];
+      if (p[1] !== 0) { this.out(6, [6, 1, ...enc.encode((C2_PROTOS.find(x => x[0] === p[1])?.[1] || '?') + ':  ' + (p[1] < 4 ? 'exist' : 'not exist!'))], 400); return; }
+      const ent = [[7, 0, 5000, 5000, 3000], [11, 0, 9000, 9000, 3000], [15, 0, 15000, 15000, 3000], [18, 0, 20000, 20000, 2250], [24, 1, 3300, 11000, 5000], [25, 1, 3300, 21000, 3000]];
+      ent.forEach(([n, varb, mn, mx, ma], k) => {
+        const r = new Uint8Array(22), v = new DataView(r.buffer);
+        v.setUint32(2, 2 ** n, true); v.setUint16(11, mn, true); v.setUint16(13, varb ? 20 : 0, true); v.setUint16(15, mn, true); v.setUint16(17, mx, true); v.setUint16(19, ma, true); r[21] = 0xFF;
+        this.out(5, r, 300 + k * 20);
+      });
+    } else if (p[0] === 2) this.vset = p[3] | p[4] << 8;
+  }
   info() {
     const p = new Uint8Array(30);
-    p[0] = 1; p[1] = 2; p[2] = 50;                                   // аппаратная 1, прошивка 2.5.0
-    const v = new DataView(p.buffer); v.setUint32(7, 0x1C2D3E4F, true); v.setUint32(11, 0x5A6B7C8D, true);
+    p[0] = 10; p[1] = 3; p[2] = 80;
+    p.set(enc.encode('DEMO0001'), 7);
     p.set(enc.encode(this.model).subarray(0, 12), 15);
     p[28] = this.model === 'ATK-C2 Lite' ? 1 : 0;
-    return C2P.reply(1, p);
+    return p;
   }
-  record() {
-    const s = (performance.now() - this.t0) / 1000;
-    const step = [5000, 9000, 12000, 15000, 20000][Math.floor(s / 12) % 5];   // переговоры PD: 5, 9, 12, 15, 20 В
-    this.pdo += (step - this.pdo) * 0.25;
-    const ma = Math.max(0, 1500 + 900 * Math.sin(s * 0.7) + rnd(25));
-    const p = new Uint8Array(51), v = new DataView(p.buffer);
-    p[2] = 1;
-    v.setUint32(3, Math.round(this.pdo - ma * 0.03 + rnd(4)), true);     // мВ, просадка под нагрузкой
-    v.setUint32(7, Math.round(ma), true);                                // мА
-    v.setUint32(11, Math.round(600 + rnd(8)), true);                     // D+ мВ
-    v.setUint32(15, Math.round(Math.max(0, 8 + rnd(6))), true);          // D− мВ
-    return C2P.reply(22, p);
+  tick() {
+    const now = performance.now(), s = (now - this.t0) / 1000;
+    this.vnow += (this.vset - this.vnow) * 0.3;
+    this.ma = Math.max(0, 900 + 600 * Math.sin(s * 0.5) + rnd(15));
+    if (this.stream) {
+      const hz = [2, 4, 20, 50, 200, 500, 1000][this.mode], k = this.mode >= 5 ? 4 : 1;
+      this.acc += hz * 0.05 / k;
+      const nfr = Math.min(20, this.acc | 0); this.acc -= nfr;
+      for (let f = 0; f < nfr; f++) {
+        const p = new Uint8Array(57);
+        const put24 = (o, x) => { x = Math.max(0, Math.round(x)); p[o] = x & 255; p[o + 1] = x >> 8 & 255; p[o + 2] = x >> 16 & 255; };
+        const put16 = (o, x) => { x = Math.max(0, Math.round(x)); p[o] = x & 255; p[o + 1] = x >> 8; };
+        for (let j = 0; j < 4; j++) {
+          const rip = 25 * Math.sin((now + j * 5) * 0.7);
+          put24(j * 3, (this.vnow - this.ma * 0.03 + rip + rnd(3)) * 100); put24(12 + j * 3, (this.ma + rnd(4)) * 100);
+          put16(24 + j * 2, 600 + rnd(5)); put16(32 + j * 2, 8 + rnd(3)); put16(40 + j * 2, 0); put16(48 + j * 2, 1657 + rnd(4));
+        }
+        p[56] = 1;
+        this.parser.feed(C2P.reply(4, p));
+      }
+      if (now - this.last19 > 1500) {
+        this.last19 = now; const p = new Uint8Array(55);
+        p.set(enc.encode(this.trig === 0 ? 'PD3.0' : 'QC3.0'), 0); p.set(enc.encode('---NA---'), 18); p.set(enc.encode('PPS'), 34); p[54] = 29;
+        this.parser.feed(C2P.reply(0x19, p));
+      }
+    }
+    if (this.listen) {
+      let bits;
+      if (now - this.lastPd > 2500) { this.lastPd = now; bits = this.pdBurst(); } else bits = new Uint8Array(59 * 6).fill(0xFF);
+      for (let o = 0; o < bits.length; o += 59) {
+        const fr = new Uint8Array(59).fill(0xFF); fr.set(bits.subarray(o, o + 59));
+        this.parser.feed(C2P.frame(13, fr)); this.parser.feed(new Uint8Array([0]));
+      }
+    }
+  }
+  pdBurst() {
+    const msg = (type, n, src, objs = []) => {
+      const hdr = type | (src ? 1 << 5 : 0) | 2 << 6 | (src ? 1 << 8 : 0) | (this.msgId++ & 7) << 9 | n << 12;
+      const b = new Uint8Array(2 + objs.length * 4), v = new DataView(b.buffer); v.setUint16(0, hdr, true); objs.forEach((w, k) => v.setUint32(2 + k * 4, w >>> 0, true));
+      return pdEncodeSamples('SOP', b, 12.5, 30);
+    };
+    const parts = [msg(1, 4, 1, [0x2401912C, 0x0002D12C, 0x0004B12C, 0xC1A4213C]), msg(1, 0, 0), msg(2, 1, 0, [0x2004B12C]), msg(1, 0, 1), msg(3, 0, 1), msg(1, 0, 0), msg(6, 0, 1), msg(1, 0, 0)];
+    const len = parts.reduce((a, x) => a + x.length, 0), out = new Uint8Array(len); let o = 0;
+    for (const x of parts) { out.set(x, o); o += x.length; }
+    return out;
   }
 }

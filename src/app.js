@@ -5,6 +5,7 @@ const WINDOW_GROUPS = [
   ['Любой прибор', [['reading', 'Большое показание', 'Одна величина крупно, статистика'], ['table', 'Таблица величин', 'Много величин, мин, макс, среднее'], ['trend', 'Тренд', 'История на отдельных дорожках'], ['recorder', 'Запись данных', 'Выбранные величины в CSV'], ['console', 'Консоль SCPI', 'Ручные команды и ответы'], ['quantities', 'Величины', 'Добавить, изменить, убрать'], ['settings', 'Настройки прибора', 'Все параметры списком']]],
   ['LT1', [['lt1-lcr', 'Измеритель', 'R, L, C, Z, D, Q, θ и настройки'], ['lt1-sweep', 'АЧХ и ФЧХ', 'Скан на 100 точек']]],
   ['tinySA', [['sa-spectrum', 'Анализатор спектра', 'Скан до 100000 точек, пики, водопад'], ['sa-screen', 'Экран', 'Трансляция экрана и нажатия'], ['sa-settings', 'Настройки', 'Режим, приём, генератор, команды']]],
+  ['C2', [['c2-main', 'Тестер', 'U, I, P, D+, D−, CC, температура, протоколы, счёт Ah и Wh, тревоги'], ['c2-graph', 'Графики', 'Кривые до 1000 Гц, масштаб, курсоры, пульсации, CSV'], ['c2-trigger', 'Триггер и протоколы', 'PD, QC, FCP, SCP, AFC, UFCS и другие; автоопределение'], ['c2-pd', 'Анализатор PD', 'Прослушка линии CC и разбор сообщений'], ['c2-emarker', 'E-marker', 'Чтение, правка и запись'], ['c2-offline', 'Записи в приборе', 'Офлайн-группы в графики и CSV'], ['c2-cal', 'Калибровка', 'Самопотребление, усреднение, V и I по DM40, резервная копия'], ['c2-fw', 'Прошивка', 'Версия и дамп загрузчика']]],
   ['DM40', [['dm40-dmm', 'Мультиметр', 'Функции, пределы, скорость'], ['dm40-scope', 'Осциллограф', 'Живой сигнал, спектр, курсоры, запись'], ['dm40-gen', 'Генератор', 'Форма, частота, размах'], ['dm40-power', 'Ваттметр', 'P, S, Q, PF, энергия'], ['dm40-stream', 'Поток преобразователя', 'Каждый отсчёт AD1 или AD2'], ['dm40-decode', 'Декодер', 'UART, Modbus, DALI'], ['dm40-inrush', 'Пусковой ток', 'Захват броска тока'], ['dm40-files', 'Файлы', 'Снимки, записи, журналы'], ['dm40-screen', 'Экран прибора', 'Управление касанием через USB']]],
 ];
 
@@ -30,9 +31,17 @@ const DEFAULT_LAYOUT = () => [
     { type: 'sa-settings', cfg: {}, g: { x: 912, y: 416, w: 560, h: 296 } },
   ] },
   { name: 'C2', wins: [
-    { type: 'reading', cfg: { q: 'c2.p', digits: 5 }, g: { x: 16, y: 16, w: 400, h: 208 } },
-    { type: 'table', cfg: { ids: ['c2.vbus', 'c2.ibus', 'c2.p', 'c2.dp', 'c2.dn'] }, g: { x: 432, y: 16, w: 568, h: 208 } },
-    { type: 'trend', cfg: { ids: ['c2.vbus', 'c2.ibus'], span: 60 }, g: { x: 16, y: 240, w: 984, h: 360 } },
+    { type: 'c2-main', cfg: {}, g: { x: 16, y: 16, w: 520, h: 600 } },
+    { type: 'c2-graph', cfg: { keys: ['v', 'i', 'p'], span: 30 }, g: { x: 552, y: 16, w: 840, h: 600 } },
+  ] },
+  { name: 'C2: PD', wins: [
+    { type: 'c2-trigger', cfg: {}, g: { x: 16, y: 16, w: 560, h: 600 } },
+    { type: 'c2-pd', cfg: {}, g: { x: 592, y: 16, w: 800, h: 600 } },
+  ] },
+  { name: 'C2: сервис', wins: [
+    { type: 'c2-cal', cfg: {}, g: { x: 16, y: 16, w: 760, h: 600 } },
+    { type: 'c2-emarker', cfg: {}, g: { x: 792, y: 16, w: 600, h: 360 } },
+    { type: 'c2-offline', cfg: {}, g: { x: 792, y: 392, w: 600, h: 224 } },
   ] },
   { name: 'Данные', wins: [
     { type: 'recorder', cfg: {}, g: { x: 16, y: 16, w: 384, h: 344 } },
@@ -77,6 +86,7 @@ const App = {
         card(BleLink.available, 'C2 по Bluetooth LE', 'C2 Std и Pro без сопряжения. В C2 Lite Bluetooth нет.', async () => { const t = await BleLink.pick(); t.proto = 'c2'; return t; }),
         card(SerialLink.available, 'C2 через COM или SPP', 'Классический Bluetooth C2 после сопряжения в системе или адаптер USB-UART.', async () => { const t = await SerialLink.pick(+baud.value); t.proto = 'c2'; return t; }),
         h('button', { class: 'card', onclick: () => { d.close(); store.set('wsUrl', wsUrl.value); this.connect(async () => new WsLink(wsUrl.value)); } }, h('b', { text: 'Мост WebSocket' }), h('small', { text: 'Для Firefox и Safari: прибор подключается через bridge.py.' })),
+        h('button', { class: 'card', onclick: () => { d.close(); store.set('wsUrl', wsUrl.value); this.connect(async () => { const t = new WsLink(wsUrl.value); t.proto = 'c2'; return t; }); } }, h('b', { text: 'C2 через мост' }), h('small', { text: 'bridge.py c2: C2 по USB для любого браузера, нужен Python.' })),
         h('button', { class: 'card', onclick: () => { d.close(); this.startDemo(); } }, h('b', { text: 'Демо' }), h('small', { text: 'Симуляторы LT1, DM40, tinySA и C2 со случайными данными.' }))),
       h('div', { class: 'row wrap' }, field('Скорость COM-порта', baud), field('Адрес моста', wsUrl)),
       h('details', {}, h('summary', { text: 'DM40 не появляется в списке USB (Windows)' }),
@@ -161,8 +171,8 @@ const App = {
     try {
       const pick = d => UsbVendor.match(d) ? new UsbVendor(d) : new UsbTmc(d);
       for (const d of (await navigator.usb?.getDevices()) || []) await this.connect(async () => pick(d));
-      navigator.usb?.addEventListener('connect', e => this.connect(async () => pick(e.device)));
-      navigator.usb?.addEventListener('disconnect', e => { const d = Devices.list.find(x => x.link.tr.dev === e.device); if (d) { toast(`${d.title}: кабель отключён`, 'warn'); Devices.remove(d); } });
+      navigator.usb?.addEventListener('connect', e => { if (!C2FW.busy) this.connect(async () => pick(e.device)); });   // во время прошивки C2 USB занимает сама прошивка
+      navigator.usb?.addEventListener('disconnect', e => { if (C2FW.busy) return; const d = Devices.list.find(x => x.link.tr.dev === e.device); if (d) { toast(`${d.title}: кабель отключён`, 'warn'); Devices.remove(d); } });
     } catch { }
   },
   async start() {

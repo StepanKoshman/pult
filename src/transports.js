@@ -352,7 +352,7 @@ class C2Frame {
       if (i) this.drop(i);
       if (this.len < 4) return null;
       const L = this.buf[2], cmd = this.buf[1], need = 4 + L;
-      if (L > 59 || cmd < 1 || cmd > 0x20) { this.bad++; this.drop(1); continue; }   // кадр C2 всегда помещается в 64 байта
+      if (L > 59 || cmd < 1 || cmd > 0x22) { this.bad++; this.drop(1); continue; }   // кадр C2 всегда помещается в 64 байта; 0x21, 0x22 приходят сами
       if (this.len < need) return null;
       if (this.buf[3 + L] !== C2P.cksum(this.buf, 3 + L)) { this.bad++; this.drop(1); continue; }
       const out = this.buf.slice(0, need);
@@ -409,15 +409,19 @@ class UsbVendor extends Emitter {
     this.alive = true;
     this.pump();
   }
+  /* Несколько чтений в очереди сразу: прослушка PD идёт потоком ~470 КБ/с, одно чтение за раз её не вытягивает. */
   async pump() {
+    const N = 6, size = this.mps * 64, q = [];
+    const issue = () => q.push(this.dev.transferIn(this.epIn, size).catch(e => ({ error: e })));
+    for (let k = 0; k < N; k++) issue();
     while (this.alive) {
-      let r;
-      try { r = await this.dev.transferIn(this.epIn, this.mps); }
-      catch (e) { if (this.alive) this.emit('lost', e); return; }
-      if (r.status === 'stall') { await this.dev.clearHalt('in', this.epIn).catch(() => { }); continue; }
-      if (r.status === 'babble') continue;
-      if (r.status !== 'ok') { if (this.alive) this.emit('lost', new Error('USB: ' + r.status)); return; }
-      if (r.data?.byteLength) { this.rxBytes += r.data.byteLength; this.parser.feed(new Uint8Array(r.data.buffer, r.data.byteOffset, r.data.byteLength)); }
+      const r = await q.shift();
+      if (!this.alive) return;
+      if (r.error) { this.emit('lost', r.error); return; }
+      if (r.status === 'stall') { await this.dev.clearHalt('in', this.epIn).catch(() => { }); issue(); continue; }
+      if (r.status === 'ok' && r.data?.byteLength) { this.rxBytes += r.data.byteLength; this.parser.feed(new Uint8Array(r.data.buffer, r.data.byteOffset, r.data.byteLength)); }
+      else if (r.status !== 'ok' && r.status !== 'babble') { this.emit('lost', new Error('USB: ' + r.status)); return; }
+      issue();
     }
   }
   async close() { this.alive = false; try { await this.dev.releaseInterface(this.ifn); } catch { } try { await this.dev.close(); } catch { } }
@@ -456,7 +460,16 @@ class C2Link extends Emitter {
     this.q = p.catch(() => { });
     return p;
   }
-  request(cmd, payload = [], { timeout = 2000 } = {}) {
+  /* Запросы с одной командой идут по очереди: прибор отвечает кадром с тем же номером,
+     и два ожидающих одну команду иначе путали бы ответы (окно калибровки опрашивает 0x1E,
+     а дамп памяти шлёт тот же 0x1E). */
+  request(cmd, payload = [], o = {}) {
+    this.chain ??= new Map();
+    const p = (this.chain.get(cmd) || Promise.resolve()).then(() => this.request1(cmd, payload, o));
+    this.chain.set(cmd, p.catch(() => { }));
+    return p;
+  }
+  request1(cmd, payload = [], { timeout = 2000 } = {}) {
     return new Promise((res, rej) => {
       const old = this.wait.get(cmd);
       if (old) { clearTimeout(old.timer); old.rej(new Error('Запрос перекрыт новым')); }

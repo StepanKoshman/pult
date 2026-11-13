@@ -239,3 +239,24 @@ details p { margin-top: 6px; max-width: 66ch; }
 fieldset.sa-set { border: 1px solid var(--line); border-radius: 4px; margin: 0 0 8px; padding: 4px 8px 8px; min-width: 0; }
 fieldset.sa-set legend { font: 600 .8em/1.2 var(--f-label); letter-spacing: .08em; color: var(--ink3); text-transform: uppercase; padding: 0 4px; }
 fieldset.sa-set .row { align-items: flex-end; }
+
+/* ---------- C2 ---------- */
+.c2-big { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; flex: none; }
+.c2-cell { background: var(--screen); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.c2-cell span { font-size: .8em; color: var(--ink3); }
+.c2-cell b { font: 600 1.55em/1.1 var(--f-mono); color: var(--screen-ink); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; }
+.win-body > .c2-keys, .win-body > .c2-cursors, .win-body > .c2-status { flex: none; }
+.c2-keys { padding: 4px 10px; gap: 2px 12px; font-size: .9em; }
+.c2-cursors { padding: 4px 10px 6px; max-height: 34%; overflow: auto; font: .84em/1.45 var(--f-mono); color: var(--ink2); }
+.c2-pdsplit { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 6px; padding: 0 8px 8px; }
+.c2-pdlist { position: relative; border: 1px solid var(--line); border-radius: 4px; background: var(--screen); }
+.c2-rows { position: absolute; left: 0; right: 0; top: 0; }
+.c2-pdrow { height: 22px; display: grid; grid-template-columns: 54px 84px 74px 76px 150px minmax(0, 1fr); gap: 6px; align-items: center; padding: 0 6px; font: .82em var(--f-mono); color: var(--screen-ink); white-space: nowrap; cursor: pointer; }
+.c2-pdrow > * { overflow: hidden; text-overflow: ellipsis; }
+.c2-pdrow:hover { background: var(--raised); }
+.c2-pdrow.on { background: var(--accent); color: var(--on-accent); }
+.c2-pdrow.bad { color: var(--bad); }
+.c2-pddet { border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; font-size: .9em; display: flex; flex-direction: column; gap: 4px; }
+.c2-pddet pre { white-space: pre-wrap; word-break: break-all; font: .82em var(--f-mono); margin: 0; }
+.c2-warn { color: var(--bad); }
+.row.on { outline: 1px solid var(--accent); border-radius: 4px; padding: 2px 4px; }

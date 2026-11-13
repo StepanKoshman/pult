@@ -316,66 +316,7 @@ class LT1 extends Device {
   windows() { return ['lt1-lcr', 'reading', 'lt1-sweep', 'settings']; }
 }
 
-/* ---------- ALIENTEK C2 (Lite, Std, Pro: одна прошивка, модель в настройках) ----------
-   Протокол бинарный (C2Link), см. C2_PROTOCOL.md. Команда 1: сведения о приборе,
-   команда 22: запись измерения. Драйвер только читает: команды записи и вход в
-   обновление (15) сюда намеренно не включены. */
-const C2_FIELDS = [            // [ключ, имя, единица, масштаб сырого u32]; масштаб предварительный
-  ['vbus', 'Напряжение VBUS', 'V', 1e-3],
-  ['ibus', 'Ток VBUS', 'A', 1e-3],
-  ['dp', 'Напряжение D+', 'V', 1e-3],
-  ['dn', 'Напряжение D−', 'V', 1e-3],
-];
-
-function c2Info(p) {
-  if (!p || p.length < 27) return null;
-  let model = '';
-  for (let i = 15; i < 27 && p[i]; i++) model += String.fromCharCode(p[i]);
-  const u32 = o => (p[o] | p[o + 1] << 8 | p[o + 2] << 16 | p[o + 3] << 24) >>> 0;
-  const serial = u32(7).toString(16).padStart(8, '0') + u32(11).toString(16).padStart(8, '0');
-  return { model: model.trim() || 'ATK-C2', fw: `${p[1]}.${(p[2] / 10) | 0}.${p[2] % 10}`, hw: p[0], lite: p[28] === 1, serial: serial.toUpperCase() };
-}
-
-class C2 extends Device {
-  id = 'c2'; title = 'C2';
-  constructor(link, info) {
-    super(link, `ALIENTEK,${info.model},${info.serial},${info.fw}`);
-    this.info = info;
-    this.title = info.model.replace(/^ATK-/, '') || 'C2';
-  }
-  async start() {
-    const c = this.s;
-    Object.assign(c, { pollMs: store.get('c2.poll', 50), rate: 0, frames: 0, bad: 0 });
-    for (const [k, name, unit] of C2_FIELDS) Hub.define({ id: 'c2.' + k, name, unit, dev: this.id, group: 'C2', digits: 5 });
-    Hub.define({ id: 'c2.p', name: 'Мощность', unit: 'W', dev: this.id, group: 'C2', digits: 5 });
-    this.alive = true;
-    this.offFrame = this.link.on('frame', f => this.onFrame(f));
-    this.loop();
-  }
-  onFrame(f) {
-    if (f.cmd !== 22 || f.payload.length < 19) return;
-    const p = f.payload, v = new DataView(p.buffer, p.byteOffset, p.byteLength), o = {};
-    C2_FIELDS.forEach(([k, , , sc], i) => { o[k] = v.getUint32(3 + i * 4, true) * sc; Hub.push('c2.' + k, o[k]); });
-    Hub.push('c2.p', o.vbus * o.ibus);
-    this.s.frames++;
-    if (this.state !== 'ok') { this.state = 'ok'; this.emit('state'); }
-  }
-  async loop() {
-    const c = this.s; let last = performance.now(), base = 0;
-    while (this.alive) {
-      const t0 = performance.now();
-      try { await this.link.send(22, [0]); }
-      catch (e) { if (!this.alive) return; this.fail(e); await sleep(400); }
-      if (t0 - last >= 1000) {
-        c.rate = (c.frames - base) / ((t0 - last) / 1000); base = c.frames; last = t0;
-        c.bad = this.link.tr.parser?.bad ?? 0; this.emit('rate');
-      }
-      await sleep(Math.max(0, c.pollMs - (performance.now() - t0)));
-    }
-  }
-  async stop() { this.alive = false; this.offFrame?.(); try { await this.link.close(); } catch { } Hub.removeDev(this.id); }
-  windows() { return ['reading', 'table', 'trend']; }
-}
+/* ALIENTEK C2: драйвер и окна в c2.js */
 
 /* ---------- любой SCPI-прибор ---------- */
 class GenericScpi extends Device {
@@ -433,11 +374,22 @@ const Devices = new (class extends Emitter {
     link.start();
     let info = null;
     for (let i = 0; i < 3 && !info; i++) info = c2Info(await link.request(1, [], { timeout: 1500 }).catch(() => null));
-    if (!info) { await link.close(); throw new Error('C2 не ответил на запрос сведений. Проверьте кабель или Bluetooth и что прибор включён.'); }
+    if (!info) {
+      await link.close();
+      if (tr.kind === 'usb' || tr.kind === 'ws') {                          // может быть, прибор в загрузчике (прошивка стёрта или запись прервалась)
+        const src = tr.kind === 'usb' ? tr.dev : tr.url;
+        const lt = c2LoaderTr(tr.kind, src);
+        let ok = false;
+        try { await lt.open(); ok = !!await c2AfTx(lt, 0x10, 0, undefined, 600, 2); } catch { }
+        await lt.close().catch(() => { });
+        if (ok) { c2LoaderFound(tr.kind, src); throw new Error('C2 в режиме загрузчика: выберите файл прошивки в открывшемся окне.'); }
+      }
+      throw new Error('C2 не ответил на запрос сведений. Проверьте кабель или Bluetooth и что прибор включён.');
+    }
     const dev = new C2(link, info);
     const same = this.get(dev.id);
     if (same) await this.remove(same);
-    await dev.start();
+    try { await dev.start(); } catch (e) { dev.alive = false; dev.offFrame?.(); Hub.removeDev(dev.id); await link.close().catch(() => { }); throw e; }
     this.list.push(dev);
     this.emit('change');
     return dev;
