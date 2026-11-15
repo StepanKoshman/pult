@@ -260,3 +260,6 @@ fieldset.sa-set .row { align-items: flex-end; }
 .c2-pddet pre { white-space: pre-wrap; word-break: break-all; font: .82em var(--f-mono); margin: 0; }
 .c2-warn { color: var(--bad); }
 .row.on { outline: 1px solid var(--accent); border-radius: 4px; padding: 2px 4px; }
+/* EL15 */
+.el-set { width: 120px; font: 600 1.15em var(--f-mono); }
+.el-on { min-width: 160px; padding: 8px 14px; }

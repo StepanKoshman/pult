@@ -357,7 +357,7 @@ const Devices = new (class extends Emitter {
         if (!sa) { await tr.close(); throw new Error('Прибор не ответил на *IDN?. Проверьте кабель и что в приборе включён нужный режим.'); }
       }
     }
-    const Cls = sa ? TinySA : [DM40, LT1].find(c => c.probe(idn)) || GenericScpi;
+    const Cls = sa ? TinySA : [DM40, LT1, EL15].find(c => c.probe(idn)) || GenericScpi;
     const dev = new Cls(link, sa ? sa.idn : idn);
     if (sa) { dev.p = sa.p; dev.info = sa.info; }
     const same = this.get(dev.id);

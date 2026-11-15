@@ -6,6 +6,7 @@ const WINDOW_GROUPS = [
   ['LT1', [['lt1-lcr', 'Измеритель', 'R, L, C, Z, D, Q, θ и настройки'], ['lt1-sweep', 'АЧХ и ФЧХ', 'Скан на 100 точек']]],
   ['tinySA', [['sa-spectrum', 'Анализатор спектра', 'Скан до 100000 точек, пики, водопад'], ['sa-screen', 'Экран', 'Трансляция экрана и нажатия'], ['sa-settings', 'Настройки', 'Режим, приём, генератор, команды']]],
   ['C2', [['c2-main', 'Тестер', 'U, I, P, D+, D−, CC, температура, протоколы, счёт Ah и Wh, тревоги'], ['c2-graph', 'Графики', 'Кривые до 1000 Гц, масштаб, курсоры, пульсации, CSV'], ['c2-trigger', 'Триггер и протоколы', 'PD, QC, FCP, SCP, AFC, UFCS и другие; автоопределение'], ['c2-pd', 'Анализатор PD', 'Прослушка линии CC и разбор сообщений'], ['c2-emarker', 'E-marker', 'Чтение, правка и запись'], ['c2-offline', 'Записи в приборе', 'Офлайн-группы в графики и CSV'], ['c2-cal', 'Калибровка', 'Самопотребление, усреднение, V и I по DM40, резервная копия'], ['c2-fw', 'Прошивка', 'Версия и дамп загрузчика']]],
+  ['EL15', [['el15-main', 'Нагрузка', 'U, I, P, R, температура, Ah и Wh; CC, CV, CR, CP, уставка, вход, 2W и 4W'], ['el15-modes', 'Режимы', 'Список, динамика, скан, разряд АКБ, DCR, LED, MPPT, срабатывание защиты, тест БП'], ['el15-curve', 'Кривые', 'V от Ah, I от V, P от V; опорная кривая, CSV'], ['el15-prot', 'Защиты и настройки', 'OVP, OCP, OPP, OTP, UVP, плавный старт, вентилятор, экран'], ['el15-log', 'Журнал прибора', 'До 8000 точек без компьютера'], ['el15-cal', 'Калибровка', 'Напряжение 2W и 4W, ток по DM40; резервная копия']]],
   ['DM40', [['dm40-dmm', 'Мультиметр', 'Функции, пределы, скорость'], ['dm40-scope', 'Осциллограф', 'Живой сигнал, спектр, курсоры, запись'], ['dm40-gen', 'Генератор', 'Форма, частота, размах'], ['dm40-power', 'Ваттметр', 'P, S, Q, PF, энергия'], ['dm40-stream', 'Поток преобразователя', 'Каждый отсчёт AD1 или AD2'], ['dm40-decode', 'Декодер', 'UART, Modbus, DALI'], ['dm40-inrush', 'Пусковой ток', 'Захват броска тока'], ['dm40-files', 'Файлы', 'Снимки, записи, журналы'], ['dm40-screen', 'Экран прибора', 'Управление касанием через USB']]],
 ];
 
@@ -43,6 +44,7 @@ const DEFAULT_LAYOUT = () => [
     { type: 'c2-emarker', cfg: {}, g: { x: 792, y: 16, w: 600, h: 360 } },
     { type: 'c2-offline', cfg: {}, g: { x: 792, y: 392, w: 600, h: 224 } },
   ] },
+  ...EL15_DESKS(),
   { name: 'Данные', wins: [
     { type: 'recorder', cfg: {}, g: { x: 16, y: 16, w: 384, h: 344 } },
     { type: 'console', cfg: {}, g: { x: 416, y: 16, w: 560, h: 344 } },
@@ -80,14 +82,14 @@ const App = {
     const body = h('div', { class: 'col' },
       h('div', { class: 'cards' },
         card(UsbTmc.available, 'USB-кабель', 'USBTMC: LT1, DM40 и другие SCPI-приборы. Самая высокая скорость.', () => UsbTmc.pick()),
-        card(SerialLink.available, 'COM-порт и Bluetooth SPP', 'tinySA по USB (виртуальный COM-порт). DM40 по классическому Bluetooth: сначала сопрягите его в системе. Подходит и для адаптеров USB-UART.', () => SerialLink.pick(+baud.value)),
-        card(BleLink.available, 'Bluetooth LE', 'Прямое подключение без сопряжения. Канал обмена ищется автоматически.', () => BleLink.pick()),
+        card(SerialLink.available, 'COM-порт и Bluetooth SPP', 'tinySA и EL15 по USB (виртуальный COM-порт). DM40 по классическому Bluetooth: сначала сопрягите его в системе. Подходит и для адаптеров USB-UART.', () => SerialLink.pick(+baud.value)),
+        card(BleLink.available, 'Bluetooth LE', 'Прямое подключение без сопряжения: DM40, LT1, EL15. Канал обмена ищется автоматически.', () => BleLink.pick()),
         card(UsbVendor.available, 'C2 по USB', 'ALIENTEK C2 Lite, Std, Pro. Bulk 64 байта с непрерывным чтением: самая высокая скорость. Драйвер WinUSB Windows ставит сама.', () => UsbVendor.pick()),
         card(BleLink.available, 'C2 по Bluetooth LE', 'C2 Std и Pro без сопряжения: измерения и протоколы зарядки. Управление и прошивка только по USB. Bluetooth включается в настройках C2. В C2 Lite Bluetooth нет.', async () => { const t = await BleLink.pickAny(); t.proto = 'c2'; return t; }),
         card(SerialLink.available, 'C2 через COM или SPP', 'Классический Bluetooth C2 после сопряжения в системе или адаптер USB-UART.', async () => { const t = await SerialLink.pick(+baud.value); t.proto = 'c2'; return t; }),
         h('button', { class: 'card', onclick: () => { d.close(); store.set('wsUrl', wsUrl.value); this.connect(async () => new WsLink(wsUrl.value)); } }, h('b', { text: 'Мост WebSocket' }), h('small', { text: 'Для Firefox и Safari: прибор подключается через bridge.py.' })),
         h('button', { class: 'card', onclick: () => { d.close(); store.set('wsUrl', wsUrl.value); this.connect(async () => { const t = new WsLink(wsUrl.value); t.proto = 'c2'; return t; }); } }, h('b', { text: 'C2 через мост' }), h('small', { text: 'bridge.py c2: C2 по USB для любого браузера, нужен Python.' })),
-        h('button', { class: 'card', onclick: () => { d.close(); this.startDemo(); } }, h('b', { text: 'Демо' }), h('small', { text: 'Симуляторы LT1, DM40, tinySA и C2 со случайными данными.' }))),
+        h('button', { class: 'card', onclick: () => { d.close(); this.startDemo(); } }, h('b', { text: 'Демо' }), h('small', { text: 'Симуляторы LT1, DM40, tinySA, C2 и EL15 со случайными данными.' }))),
       h('div', { class: 'row wrap' }, field('Скорость COM-порта', baud), field('Адрес моста', wsUrl)),
       h('details', {}, h('summary', { text: 'DM40 не появляется в списке USB (Windows)' }),
         h('p', { text: 'Windows не содержит драйвера USBTMC, поэтому браузер не может открыть этот интерфейс. Сборка opendm40 с поддержкой этой программы подключает WinUSB сама. На более старых сборках установите WinUSB один раз через Zadig: Options > List All Devices, выберите интерфейс USBTMC устройства DM40 (не mass storage), WinUSB, Install Driver. Диск при этом продолжит работать.' })),
@@ -149,6 +151,7 @@ const App = {
     }
     await Devices.attach(new SimSaLink()).catch(e => toast(e.message, 'bad'));
     await Devices.attach(new SimC2()).catch(e => toast(e.message, 'bad'));
+    await Devices.attach(new SimLink(new SimEL15())).catch(e => toast(e.message, 'bad'));
   },
   addCalc(c, keep) {
     const q = Hub.define({ id: c.id, name: c.name, unit: c.unit, dev: 'calc', group: 'Формулы', digits: 5 });
@@ -187,7 +190,11 @@ const App = {
     Bus.on('desk', () => this.drawTabs()); Bus.on('desks', () => this.drawTabs());
     await this.startDemo();
     for (const c of Calc.items) { try { this.addCalc({ ...c }, true); } catch { } }
-    WM.load(store.get('layout', null) || DEFAULT_LAYOUT());
+    let lay = store.get('layout', null);
+    /* Столы EL15 появились в 1.3.0: добавить их к сохранённой раскладке один раз. */
+    if (lay && !store.get('el15.desks', false) && !lay.some(d => d.wins.some(w => w.type.startsWith('el15-')))) { const i = lay.findIndex(d => d.name === 'Данные'); lay.splice(i < 0 ? lay.length : i, 0, ...EL15_DESKS()); }
+    store.set('el15.desks', true);
+    WM.load(lay || DEFAULT_LAYOUT());
     setInterval(() => this.calcTick(), 100);
     requestAnimationFrame(t => this.frame(t));
     this.autoReconnect();

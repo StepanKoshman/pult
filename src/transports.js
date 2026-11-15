@@ -212,7 +212,7 @@ class BleLink extends Emitter {
   constructor(device) { super(); this.dev = device; this.parser = new StreamParser(); this.kind = 'bt'; this.name = device?.name || 'BLE'; this.mtu = 20; }
   static async pick() {
     return new BleLink(await navigator.bluetooth.requestDevice({
-      filters: [{ namePrefix: 'DM40' }, { namePrefix: 'C-1-ATK' }, { namePrefix: 'LT1' }, { namePrefix: 'ATK' }, { namePrefix: 'C2' }],
+      filters: [{ namePrefix: 'DM40' }, { namePrefix: 'C-1-ATK' }, { namePrefix: 'LT1' }, { namePrefix: 'ATK' }, { namePrefix: 'C2' }, { namePrefix: 'EL15' }],
       optionalServices: BLE_SERVICES,
     }));
   }
@@ -224,9 +224,15 @@ class BleLink extends Emitter {
     const services = await srv.getPrimaryServices();
     for (const s of services) {
       let tx = null, rx = null;
-      for (const c of await s.getCharacteristics()) {
+      const chars = await s.getCharacteristics();
+      for (const c of chars) {
         if (!rx && (c.properties.notify || c.properties.indicate)) rx = c;
         if (!tx && (c.properties.writeWithoutResponse || c.properties.write)) tx = c;
+      }
+      /* EL15 (служба FFF0): приём FFF2, передача FFF3, а FFF1 тоже умеет уведомлять. */
+      if (/^EL15/i.test(this.dev?.name || '')) {
+        rx = chars.find(c => /fff2/i.test(c.uuid) && (c.properties.notify || c.properties.indicate)) || rx;
+        tx = chars.find(c => /fff3/i.test(c.uuid) && (c.properties.writeWithoutResponse || c.properties.write)) || tx;
       }
       if (tx && rx) { this.tx = tx; this.rx = rx; this.service = s.uuid; break; }
     }

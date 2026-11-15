@@ -38,10 +38,13 @@ class SimBase {
   }
 }
 
+/* Общий стенд демо: DM40 меряет то, что идёт через симулятор EL15 (для калибровки EL15 по DM40). */
+const SimWorld = { el15: null };
+
 /* ---------- DM40 ---------- */
 const SIM_FUNCS = {
-  VOLT: () => 3.29872 + rnd(2e-4), 'VOLT:AC': () => 1.20213 + rnd(4e-4), 'VOLT:ACDC': () => 3.5099 + rnd(5e-4), 'VOLT:AUTO': () => 3.2987 + rnd(2e-4),
-  CURR: () => 0.024816 + rnd(3e-6), 'CURR:AC': () => 0.01275 + rnd(5e-6), 'CURR:ACDC': () => 0.02793 + rnd(5e-6), 'CURR:AUTO': () => 0.024816 + rnd(3e-6),
+  VOLT: () => SimWorld.el15 ? SimWorld.el15.trueV() + rnd(2e-5) : 3.29872 + rnd(2e-4), 'VOLT:AC': () => 1.20213 + rnd(4e-4), 'VOLT:ACDC': () => 3.5099 + rnd(5e-4), 'VOLT:AUTO': () => 3.2987 + rnd(2e-4),
+  CURR: () => SimWorld.el15 ? SimWorld.el15.trueI() + rnd(3e-6) : 0.024816 + rnd(3e-6), 'CURR:AC': () => 0.01275 + rnd(5e-6), 'CURR:ACDC': () => 0.02793 + rnd(5e-6), 'CURR:AUTO': () => 0.024816 + rnd(3e-6),
   RES: () => 4698.3 + rnd(0.4), CONT: () => 0.183 + rnd(0.01), DIOD: () => 0.6512 + rnd(1e-4), CAP: () => 9.87e-6 + rnd(2e-9),
   FREQ: () => 1000.02 + rnd(0.01), TEMP: () => 24.6 + rnd(0.05), POW: () => 12.41 + rnd(0.02),
 };

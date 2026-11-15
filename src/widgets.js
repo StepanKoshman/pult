@@ -229,7 +229,7 @@ WM.define('recorder', {
 });
 
 /* ---------- консоль SCPI ---------- */
-const SCPI_HINTS = ['*IDN?', '*CLS', 'SYST:ERR?', 'SYST:TEMP?', 'FUNC?', 'CONF?', 'READ?', 'FETC?', 'RATE?', 'RATE FAST', 'CALC:AHOL ON', 'CALC:AVER?', 'TIM:SCAL?', 'CHAN1:SCAL?', 'TRIG:STAT?', 'WAV:PRE?', 'SOUR:FREQ 1000', 'OUTP ON', 'MMEM:CAT?', 'LCR:FREQ?', 'LCR:LEV?', 'LCR:AVER?', 'FETC?'];
+const SCPI_HINTS = ['*IDN?', '*CLS', 'SYST:ERR?', 'SYST:TEMP?', 'FUNC?', 'CONF?', 'READ?', 'FETC?', 'RATE?', 'RATE FAST', 'CALC:AHOL ON', 'CALC:AVER?', 'TIM:SCAL?', 'CHAN1:SCAL?', 'TRIG:STAT?', 'WAV:PRE?', 'SOUR:FREQ 1000', 'OUTP ON', 'MMEM:CAT?', 'LCR:FREQ?', 'LCR:LEV?', 'LCR:AVER?', 'FETC?', 'MEAS:ALL?', 'SYST:SET?', 'FUNC CC', 'CURR 0.5', 'INP ON', 'INP OFF', 'SYST:SENS 4W', 'CAL:STAT?', 'LOG:STAT?'];
 
 WM.define('console', {
   title: 'Консоль SCPI', w: 520, h: 320,
