@@ -771,6 +771,74 @@ function c2Info(p) {
   return { model: model || 'ATK-C2', fw: `${p[1]}.${(p[2] / 10) | 0}.${p[2] % 10}`, hw: p[0], lite: p[28] === 1, serial: c2str(p, 7, 15) || 'C2' };
 }
 
+/* ======================= C2 по Bluetooth LE =======================
+   По Bluetooth у C2 свой протокол (разбор прошивки 3.8.0, FUN_0001ab18), не кадры EE.
+   Запрос: AF 0A 03 cmd len payload ck. Ответ: DF a b cmd len payload ck. ck = -(сумма всех байт перед ним).
+   Команды: 0 рукопожатие (ответ 0A 03 41/42/43 = Pro/Std/Lite, включает накопление измерений),
+   1 подтверждение, 2 сведения (29 байт), 4 опрос: блок 199 байт, когда накопилось 10 отсчётов, иначе тишина,
+   0x0B записать имя (до 12 символов), 0x0C прочитать имя. Без опроса 15 с прибор перестаёт копить блоки.
+   Блок: 6 строк протоколов (как в кадре EE 19), [57] 10 x u24 V (1e-5), [87] 10 x u24 I, [117] 10 x u16 D+ мВ,
+   [137] D-, [157] CC1, [177] CC2, [197] направление тока, [198] температура. Управление (триггеры, PD,
+   калибровка, прошивка) по Bluetooth прибор не принимает. */
+class C2BleParser extends C2Frame {
+  take() {
+    for (; ;) {
+      let i = 0;
+      while (i < this.len && this.buf[i] !== 0xDF) i++;
+      if (i) this.drop(i);
+      if (this.len < 5) return null;
+      const L = this.buf[4], need = 6 + L;
+      if (this.buf[3] > 0x0C) { this.drop(1); continue; }
+      if (this.len < need) return null;
+      if (this.buf[5 + L] !== C2P.cksum(this.buf, 5 + L)) { this.bad++; this.drop(1); continue; }
+      const out = this.buf.slice(0, need); this.drop(need); return out;
+    }
+  }
+}
+class C2BleLink extends Emitter {
+  constructor(tr) { super(); this.tr = tr; this.ble = true; this.alive = false; this.bytes = 0; this.msgs = 0; this.errors = 0; this.wait = new Map(); this.q = Promise.resolve(); tr.on?.('lost', e => { if (this.alive) this.emit('lost', e); }); }
+  frame(cmd, p = []) { const f = new Uint8Array(6 + p.length); f[0] = 0xAF; f[1] = 0x0A; f[2] = 0x03; f[3] = cmd; f[4] = p.length; f.set(p, 5); f[5 + p.length] = C2P.cksum(f, 5 + p.length); return f; }
+  start() { if (this.alive) return; this.alive = true; this.loop(); this.poll(); }
+  async loop() {
+    while (this.alive) {
+      let f;
+      try { f = await this.tr.recv(1000); } catch (e) { if (e instanceof TimeoutError) continue; if (this.alive) { this.errors++; this.emit('lost', e); } return; }
+      this.bytes += f.length; this.msgs++;
+      const cmd = f[3], p = f.subarray(5, 5 + f[4]);
+      const w = this.wait.get(cmd); if (w) { this.wait.delete(cmd); clearTimeout(w.timer); w.res(p); }
+      if (cmd === 4 && p.length >= 199) this.emit('frame', { cmd: 0x104, payload: p, raw: f });
+    }
+  }
+  async poll() { while (this.alive) { await sleep(400); if (this.alive && this.ready) await this.raw(4).catch(() => { }); } }
+  raw(cmd, p = []) { const fr = this.frame(cmd, p), x = this.q.then(() => this.tr.send(fr)); this.q = x.catch(() => { }); return x; }
+  ask(cmd, p = [], timeout = 1500) {
+    return new Promise((res, rej) => {
+      const timer = setTimeout(() => { if (this.wait.get(cmd)?.res === res) { this.wait.delete(cmd); rej(new TimeoutError()); } }, timeout);
+      this.wait.set(cmd, { res, rej, timer });
+      this.raw(cmd, p).catch(e => { clearTimeout(timer); this.wait.delete(cmd); rej(e); });
+    });
+  }
+  async hello() {
+    let h = null;
+    for (let k = 0; k < 3 && !h; k++) h = await this.ask(0).catch(() => null);
+    if (!h) return null;
+    await this.ask(1).catch(() => { });
+    const b = await this.ask(2, [], 2000).catch(() => null);
+    const name = await this.ask(0x0C, [], 1500).catch(() => null);
+    this.ready = true;
+    return c2InfoBle(h, b, name);
+  }
+  setName(n) { return this.ask(0x0B, [...new TextEncoder().encode(n).slice(0, 12)], 3000); }
+  send() { return Promise.resolve(); }                                   // команды USB-протокола по Bluetooth прибор не понимает: молча пропускаем
+  request() { return Promise.reject(new Error('По Bluetooth эта функция C2 недоступна: подключите C2 по USB.')); }
+  async close() { this.alive = false; for (const w of this.wait.values()) clearTimeout(w.timer); this.wait.clear(); try { await this.tr.close(); } catch { } }
+}
+function c2InfoBle(h, b, name) {
+  const byModel = { 0x41: 'ATK-C2 Pro', 0x42: 'ATK-C2 Std', 0x43: 'ATK-C2 Lite' }[h?.[2]];
+  const model = (b && b.length >= 26 && c2str(b, 14, 26)) || byModel || 'ATK-C2';
+  return { model, fw: '—', hw: b?.[0] ?? 0, lite: b?.[27] === 1, serial: (b && b.length >= 14 && c2str(b, 6, 14)) || 'C2', ble: true, bleName: name ? c2str(name, 0, name.length) : '' };
+}
+
 /* ======================= хранилище кривых ======================= */
 class C2Data {
   constructor(n = 1 << 19) {
@@ -1001,7 +1069,7 @@ class C2 extends Device {
     super(link, `ALIENTEK,${info.model},${info.serial},${info.fw}`);
     this.info = info; this.title = info.model.replace(/^ATK-/, '') || 'C2';
   }
-  get fwText() { return this.ext ? `прошивка с командами Пульта v${this.ext.proto}` : 'родная прошивка'; }
+  get fwText() { if (this.link?.ble) return 'по Bluetooth: только измерения, без управления'; return this.ext ? `прошивка с командами Пульта v${this.ext.proto}` : 'родная прошивка'; }
   async start() {
     const s = this.s;
     Object.assign(s, { rate: store.get('c2.rate', 2), page: null, dir: 0, temp: NaN, protos: [], frames: 0, fps: 0, bad: 0, listen: false, fsPd: 3.75e6, ccEvents: [] });
@@ -1034,7 +1102,7 @@ class C2 extends Device {
       const now = performance.now(), c = this.s;
       c.fps = (c.frames - base) / ((now - last) / 1000); base = c.frames; last = now;
       c.bad = this.link.tr.parser?.bad ?? 0;
-      const st = c.fps > 0 ? 'ok' : 'warn';
+      const st = (this.link.ble ? now - (this.tB || 0) < 20000 : c.fps > 0) ? 'ok' : 'warn';   // по Bluetooth блоки идут раз в несколько секунд
       if (st !== this.state) { this.state = st; this.lastErr = st === 'ok' ? '' : 'Нет потока измерений'; this.emit('state'); }
       this.emit('rate');
     }
@@ -1044,6 +1112,7 @@ class C2 extends Device {
     const p = f.payload, c = this.s;
     switch (f.cmd) {
       case 0x04: if (p.length >= 57) this.onSamples(p); break;
+      case 0x104: this.onBleBlock(p); break;
       case 0x19: if (p.length >= 55) { c.protos = [c2str(p, 0, 10), c2str(p, 10, 18), c2str(p, 18, 26), c2str(p, 26, 34), c2str(p, 34, 44), c2str(p, 44, 54)]; c.temp = p[54]; Hub.push('c2.t', c.temp); this.emit('protos'); } break;
       case 0x03: if (p.length >= 2) { c.rate = p[1]; this.emit('rate'); } break;
       case 0x02: c.page = p[0]; this.emit('page'); break;
@@ -1072,6 +1141,26 @@ class C2 extends Device {
     Hub.push('c2.ah', this.stats.ah, now); Hub.push('c2.wh', this.stats.wh, now);
     c.frames++;
     this.checkAlarm(c2u24(p, 0) * 1e-5, c2u24(p, 12) * 1e-5);
+  }
+  /* Блок из 10 отсчётов по Bluetooth: время раскладываем равномерно по интервалу между блоками. */
+  onBleBlock(p) {
+    const c = this.s, now = performance.now(), n = 10;
+    const span = this.tB ? Math.min(Math.max(now - this.tB, 200), 10000) : 1000; this.tB = now;
+    c.protos = [c2str(p, 0, 10), c2str(p, 10, 18), c2str(p, 18, 26), c2str(p, 26, 34), c2str(p, 34, 44), c2str(p, 44, 55)]; this.emit('protos');
+    c.dir = p[197]; c.temp = p[198]; Hub.push('c2.t', c.temp, now);
+    let v = 0, i = 0;
+    for (let j = 0; j < n; j++) {
+      const t = now - span + (j + 1) * span / n; this.tS = t;
+      v = c2u24(p, 57 + j * 3) * 1e-5; i = c2u24(p, 87 + j * 3) * 1e-5;
+      const dp = c2u16(p, 117 + j * 2) / 1000, dn = c2u16(p, 137 + j * 2) / 1000, cc1 = c2u16(p, 157 + j * 2) / 1000, cc2 = c2u16(p, 177 + j * 2) / 1000;
+      this.data.push(t, v, i, dp, dn, cc1, cc2);
+      this.accumulate(t, v, i);
+      Hub.push('c2.v', v, t); Hub.push('c2.i', i, t); Hub.push('c2.p', v * i, t); Hub.push('c2.r', i > 1e-4 ? v / i : NaN, t);
+      Hub.push('c2.dp', dp, t); Hub.push('c2.dn', dn, t); Hub.push('c2.cc1', cc1, t); Hub.push('c2.cc2', cc2, t);
+    }
+    Hub.push('c2.ah', this.stats.ah, now); Hub.push('c2.wh', this.stats.wh, now);
+    c.frames++;
+    this.checkAlarm(v, i);
   }
   accumulate(t, v, i) {
     const s = this.stats;
@@ -1240,7 +1329,7 @@ WM.define('c2-main', {
     const protos = h('div', { class: 'note' });
     const rate = select(C2_RATES.map(([m, hz]) => [m, hz + ' Гц']), dev.s.rate, v => dev.setRate(+v).catch(errToast), 'Частота измерений');
     const page = select([['', 'Экран прибора…'], ...C2_PAGES], '', v => { if (v !== '') dev.setPage(+v).catch(errToast); page.value = ''; }, 'Экран прибора');
-    win.toolbar.append(rate);
+    if (!dev.link.ble) win.toolbar.append(rate);   // по Bluetooth частоту задаёт сам прибор
     const st = { ah: h('b'), wh: h('b'), time: h('b'), st: h('span', { class: 'tag' }) };
     const r = dev.stats.stopRule, a = dev.alarm;
     const num = (obj, k, store_k, w = 60) => h('input', { type: 'number', value: obj[k], step: 'any', style: { width: w + 'px' }, onchange: e => { obj[k] = +e.target.value; store.set(store_k, obj); } });

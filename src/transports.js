@@ -202,6 +202,8 @@ const BLE_SERVICES = [
   0xFFE0, 0xFFF0, 0xFF00, 0xFF10, 0xFFE5, 0xAE00, 0xAE30, 0xFEE7, 0xFFB0, 0xFFC0, 0xFFD0, 0xFD00, 0x18F0,
   '49535343-fe7d-4ae5-8fa9-9fafd205e455',            // ISSC/Microchip
   '0000fff0-0000-1000-8000-00805f9b34fb',
+  0xFEE9, 0xFF12, 0xFE60, 0xFF01, 0x1910, 0xFFA0, 0xFF20,
+  'e0cbf06c-cd8b-4647-bb8a-263b43f0f974', '0783b03e-8535-b5a0-7140-a304d2495cb7',
 ];
 
 class BleLink extends Emitter {
@@ -214,6 +216,8 @@ class BleLink extends Emitter {
       optionalServices: BLE_SERVICES,
     }));
   }
+  /* Без фильтра по имени: имя C2 задаёт пользователь, а модуль может показываться под своим. */
+  static async pickAny() { return new BleLink(await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: BLE_SERVICES })); }
   async open() {
     this.dev.addEventListener('gattserverdisconnected', () => this.emit('lost', new Error('Bluetooth отключился')));
     const srv = await this.dev.gatt.connect();
@@ -226,7 +230,7 @@ class BleLink extends Emitter {
       }
       if (tx && rx) { this.tx = tx; this.rx = rx; this.service = s.uuid; break; }
     }
-    if (!this.tx) throw new Error('В приборе не найден канал обмена BLE. Подключитесь через Bluetooth SPP.');
+    if (!this.tx) { const list = services.map(x => x.uuid).join(', ') || 'нет доступных'; try { this.dev.gatt.disconnect(); } catch { } throw new Error(`В приборе не найден канал обмена BLE (доступные сервисы: ${list}). Если это C2, сообщите эти данные.`); }
     this.rx.addEventListener('characteristicvaluechanged', e => { const d = e.target.value; this.parser.feed(new Uint8Array(d.buffer, d.byteOffset, d.byteLength)); });
     await this.rx.startNotifications();
   }

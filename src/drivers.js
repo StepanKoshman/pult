@@ -368,6 +368,7 @@ const Devices = new (class extends Emitter {
     return dev;
   }
   async attachC2(tr) {
+    if (tr.kind === 'bt') return this.attachC2Ble(tr);
     if (!(tr.parser instanceof C2Frame)) tr.parser = new C2Frame();   // BLE, SPP, мост: кадры EE вместо строк SCPI
     await tr.open();
     const link = new C2Link(tr);
@@ -386,6 +387,22 @@ const Devices = new (class extends Emitter {
       }
       throw new Error('C2 не ответил на запрос сведений. Проверьте кабель или Bluetooth и что прибор включён.');
     }
+    const dev = new C2(link, info);
+    const same = this.get(dev.id);
+    if (same) await this.remove(same);
+    try { await dev.start(); } catch (e) { dev.alive = false; dev.offFrame?.(); Hub.removeDev(dev.id); await link.close().catch(() => { }); throw e; }
+    this.list.push(dev);
+    this.emit('change');
+    return dev;
+  }
+  /* C2 по Bluetooth LE: свой протокол AF/DF, только измерения. */
+  async attachC2Ble(tr) {
+    tr.parser = new C2BleParser();
+    await tr.open();
+    const link = new C2BleLink(tr);
+    link.start();
+    const info = await link.hello();
+    if (!info) { await link.close(); throw new Error(`C2 не ответил по Bluetooth (канал ${tr.service || '?'}). Включите Bluetooth в настройках C2 и проверьте, что C2 не подключён к телефону.`); }
     const dev = new C2(link, info);
     const same = this.get(dev.id);
     if (same) await this.remove(same);
