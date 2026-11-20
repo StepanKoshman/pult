@@ -34,6 +34,7 @@ const el15Ver = fw => { const m = String(fw || '').match(/(\d+)\.(\d+)\.(\d+)/);
 const EL15_PNT_CH = { v2: 0, v4: 1, i: 2 };
 /* 4.7.0: частота АЦП (преобразований в секунду) и сколько это измерений U+I в секунду. */
 const EL15_BUF_MAX = 22;
+const EL15_AVER = [[0, 'Выключено'], [2, '2 измерения'], [4, '4 измерения'], [8, '8 измерений'], [16, '16 измерений'], [32, '32 измерения'], [64, '64 измерения']];
 const EL15_RATES = [[40, '40 — 20 изм./с, как с завода'], [90, '90 — 45 изм./с'], [180, '180 — 90 изм./с'], [350, '350 — 175 изм./с'], [660, '660 — 330 изм./с'], [1200, '1200 — 600 изм./с'], [2000, '2000 — 1000 изм./с']];
 function el15Pwl(P, v) {
   if (!P?.length || v === 0 || !Number.isFinite(v)) return v;
@@ -94,6 +95,7 @@ class EL15 extends Device {
     if (this.hasBuf) {
       try {
         c.adcRate = +(await this.q('MEAS:RATE?')) || 40;
+        if (this.hasAver) c.aver = +(await this.q('MEAS:AVER?')) || 0;
         for (let k = 0; k < 60 && (await this.drainBuf(false)) >= EL15_BUF_MAX; k++);
       } catch (e) { this.fail(e); }
     }
@@ -280,6 +282,9 @@ class EL15 extends Device {
     }
     return n;
   }
+  /* 4.7.4: усреднение показаний для экрана, MEAS:ALL? и журнала (буфер MEAS:BUF? не усредняется). */
+  get hasAver() { return el15Ver(this.fw) >= 40704; }
+  async setAver(n) { await this.w(`MEAS:AVER ${n}`); const r = +(await this.q('MEAS:AVER?')); this.s.aver = r; if (r !== +n) throw new Error(`прибор оставил ${r}`); return r; }
   async setAdcRate(sps) { await this.w(`MEAS:RATE ${sps}`); const r = +(await this.q('MEAS:RATE?')); this.s.adcRate = r; if (r !== +sps) throw new Error(`прибор оставил ${r}`); return r; }
   /* С 4.5.2 поправка хранится в приборе, с 4.6.0 есть 8 точек на канал. */
   get calInFlash() { return el15Ver(this.fw) >= 40502; }
@@ -438,7 +443,8 @@ class SimEL15 extends SimBase {
     const hd = m[1].toUpperCase(), arg = m[2].trim(), q = hd.endsWith('?'), k = hd.replace(/\?$/, ''), num = parseFloat(arg), a = arg.split(',').map(parseFloat), p = this.p, pr = this.prot;
     const set = (o, key, v = num) => { o[key] = v; return null; };
     switch (k) {
-      case '*IDN': return 'ALIENTEK,ATK-EL15,EL15-DEMO-0001,4.7.0';
+      case '*IDN': return 'ALIENTEK,ATK-EL15,EL15-DEMO-0001,4.7.4';
+      case 'MEAS:AVER': if (q) return String(this.aver || 0); if (!(num === 0 || num === 1 || [2, 4, 8, 16, 32, 64].includes(num))) { this.err = -222; return null; } this.aver = num > 1 ? num : 0; return null;
       case 'MEAS:RATE': if (q) return String(this.adcRate || 40); if (!EL15_RATES.some(([r]) => r === num)) { this.err = -222; return null; } this.adcRate = num; return null;
       case 'MEAS:BUF': {
         /* Измерения с частотой АЦП/2 с момента прошлого запроса, не больше 1024 в запасе. */
@@ -859,7 +865,10 @@ WM.define('el15-prot', {
       dev.hasBuf ? h('div', { class: 'col' },
         h('div', { class: 'ctl-grid' }, field('Частота АЦП, преобр./с', select(EL15_RATES, c.adcRate || 40, async v => {
           try { const r = await dev.setAdcRate(v); toast(`EL15: АЦП ${r} преобр./с, около ${Math.round(r / 2)} измерений в секунду`, 'ok'); } catch (e) { errToast(e); }
-        }, 'Частота АЦП'))),
+        }, 'Частота АЦП')), dev.hasAver ? field('Усреднение показаний', select(EL15_AVER, c.aver || 0, async v => {
+          try { const r = await dev.setAver(v); toast(r ? `EL15: среднее по ${r} измерениям, около ${(r / ((c.adcRate || 40) / 2)).toFixed(2).replace('.', ',')} с` : 'EL15: усреднение выключено', 'ok'); } catch (e) { errToast(e); }
+        }, 'Усреднение')) : ''),
+        dev.hasAver ? h('p', { class: 'note', text: 'Усреднение сглаживает U, I и P на экране прибора, в окне «Нагрузка» и в журнале прибора. Защиты, регулирование и графики из буфера по-прежнему получают каждое измерение. При резком изменении (больше 5 % + 0,05) среднее начинается заново, так что смена режима видна сразу.' }) : '',
         h('p', { class: 'note', text: 'АЦП по очереди меряет напряжение и ток (при токе больше 1,2 А — ещё второй канал тока), поэтому измерений в секунду вдвое-втрое меньше, чем преобразований. Чем выше частота, тем больше шум в последних знаках; калибровка сделана на 40, после смены частоты сверьте показания с эталоном. Прибор запоминает частоту; в сервисном режиме всегда 40.' })) : '',
       h('div', { class: 'row wrap' }, h('button', { class: 'btn', onclick: () => dev.w('SYST:BEEP:IMM').catch(errToast) }, 'Пискнуть'),
         h('button', { class: 'btn', onclick: () => dev.w('SYST:SAVE').then(() => toast('Настройки сохранены во флеш прибора', 'ok')).catch(errToast) }, 'Сохранить во флеш прибора'),
