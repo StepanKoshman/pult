@@ -5,16 +5,18 @@
      MEAS:ALL?  24 поля: V, I, P, R, T, Ah, Wh, с, вход, -, режим, уставка, авария, 4W,
                 блокировка, вентилятор %, OVP, OCP, OPP, OTP, UVP, Von, DCR мОм, внешний датчик °C
      SYST:SET?  30 полей: уставки CC/CV/CR/CP, таймер, разряд, DCR, DYN, SCAN, LIST, тест БП, экран
-     CAL:ADC? n x0,x1,x2,y0,y1,y2 и отрезки; CAL:TRIM n,g,off: таблица = заводская·g + off (в ОЗУ)
-   Пользовательская калибровка живёт в ОЗУ прибора и пропадает при выключении, поэтому Пульт
-   хранит её и записывает снова при каждом подключении. Вход в загрузчик (SYST:DFU) и правка
-   заводских таблиц отсюда не посылаются. */
+     CAL:ADC? n x0,x1,x2,y0,y1,y2 и отрезки; CAL:TRIM n,g,off: таблица = заводская·g + off
+     CAL:PNT ch,k,x,y / CAL:PNT ch,n / CAL:PNT? ch (прошивка 4.6.0): до 8 точек на канал
+       (0 = U 2W, 1 = U 4W, 2 = I), кусочно-линейная поправка поверх таблиц, хранится в приборе
+   До 4.5.2 поправка жила в ОЗУ прибора, и Пульт записывал её снова при каждом подключении.
+   С 4.5.2 прибор хранит её сам (заводские таблицы не трогаются), и Пульт её не переписывает.
+   Вход в загрузчик (SYST:DFU) и правка заводских таблиц отсюда не посылаются. */
 
 const EL15_BASIC = {
   CC: { cmd: 'CURR', unit: 'A', name: 'Ток', min: 0, max: 12, dec: 3, steps: [1, .1, .01, .001], step: .01, presets: [.1, .25, .5, 1, 2, 3, 5, 10] },
   CV: { cmd: 'VOLT', unit: 'V', name: 'Напряжение', min: .1, max: 60, dec: 3, steps: [1, .1, .01, .001], step: .1, presets: [3.3, 4.2, 5, 9, 12, 15, 20, 24] },
   CR: { cmd: 'RES', unit: 'Ω', name: 'Сопротивление', min: .1, max: 7500, dec: 1, steps: [100, 10, 1, .1], step: 1, presets: [1, 2, 5, 10, 20, 50, 100, 500] },
-  CP: { cmd: 'POW', unit: 'W', name: 'Мощность', min: 0, max: 150, dec: 2, steps: [10, 1, .1, .01], step: 1, presets: [1, 2.5, 5, 10, 25, 45, 65, 100] },
+  CP: { cmd: 'POW', unit: 'W', name: 'Мощность', min: 0, max: 250, dec: 2, steps: [10, 1, .1, .01], step: 1, presets: [1, 5, 10, 25, 50, 100, 150, 200, 250] },
 };
 const EL15_MODE_NAMES = { CC: 'CC, ток', CV: 'CV, напряжение', CR: 'CR, сопротивление', CP: 'CP, мощность', BAT: 'разряд АКБ', DCR: 'внутреннее сопротивление', DT: 'динамика', PSU: 'тест БП', OCP: 'тест БП', LIST: 'список', SCAN: 'скан', LED: 'LED', MPPT: 'MPPT', TRIP: 'время срабатывания', MENU: 'меню прибора', SET: 'меню прибора', INFO: 'меню прибора' };
 const EL15_FAULTS = ['', 'OCP: перегрузка по току', 'OVP: перенапряжение', 'OPP: перегрузка по мощности', 'OTP: перегрев', 'UVP: напряжение отсечки', 'таймер истёк', 'обратная полярность', 'циклы закончились', 'источник ушёл в защиту'];
@@ -25,6 +27,41 @@ const EL15_CAL_BLOCKS = {
 };
 /* Какой блок калибруется для величины: напряжение 2W, 4W и ток (канал 1). */
 const el15CalIdx = (hw, what) => hw === 4 ? { v2: 0, v4: 1, i: 2 }[what] : { v2: 0, v4: 2, i: 4 }[what];
+/* Версия прошивки "4.6.0" -> 40600. */
+const el15Ver = fw => { const m = String(fw || '').match(/(\d+)\.(\d+)\.(\d+)/); return m ? m[1] * 10000 + m[2] * 100 + +m[3] : 0; };
+/* Поправка по точкам [[x, y], ...] (x по возрастанию), как в прошивке 4.6.0: крайние отрезки
+   продолжаются, одна точка — сдвиг, ровно 0 остаётся 0, отрицательное — 0. И обратная к ней. */
+const EL15_PNT_CH = { v2: 0, v4: 1, i: 2 };
+/* 4.7.0: частота АЦП (преобразований в секунду) и сколько это измерений U+I в секунду. */
+const EL15_BUF_MAX = 22;
+const EL15_RATES = [[40, '40 — 20 изм./с, как с завода'], [90, '90 — 45 изм./с'], [180, '180 — 90 изм./с'], [350, '350 — 175 изм./с'], [660, '660 — 330 изм./с'], [1200, '1200 — 600 изм./с'], [2000, '2000 — 1000 изм./с']];
+function el15Pwl(P, v) {
+  if (!P?.length || v === 0 || !Number.isFinite(v)) return v;
+  if (P.length === 1) return Math.max(0, v + P[0][1] - P[0][0]);
+  let k = 0; while (k < P.length - 2 && v >= P[k + 1][0]) k++;
+  const [x0, y0] = P[k], [x1, y1] = P[k + 1];
+  return Math.max(0, y0 + (v - x0) * (y1 - y0) / (x1 - x0));
+}
+function el15PwlInv(P, c) {
+  if (!P?.length || c === 0 || !Number.isFinite(c)) return c;
+  if (P.length === 1) return c - (P[0][1] - P[0][0]);
+  let k = 0; while (k < P.length - 2 && c >= P[k + 1][1]) k++;
+  const [x0, y0] = P[k], [x1, y1] = P[k + 1];
+  return x0 + (c - y0) * (x1 - x0) / (y1 - y0);
+}
+/* Те же проверки, что делает прибор при CAL:PNT ch,n (иначе он ответит ошибкой -222). */
+function el15PntCheck(P, unit) {
+  for (let k = 0; k < P.length; k++) {
+    const [x, y] = P[k];
+    if (!(Math.abs(y - x) <= .05 * Math.abs(x) + .05)) return `точка ${fmtSI(x, unit, 5)}: эталон отличается больше чем на 5 % + 0,05`;
+    if (k) {
+      const [px, py] = P[k - 1], dx = x - px, s = (y - py) / dx;
+      if (!(dx >= .001)) return `точки ${fmtSI(px, unit, 5)} и ${fmtSI(x, unit, 5)} слишком близко (нужно не меньше 0,001)`;
+      if (!(s >= .8 && s <= 1.25)) return `между ${fmtSI(px, unit, 5)} и ${fmtSI(x, unit, 5)} наклон ${s.toFixed(3)} (допустимо 0,8…1,25)`;
+    }
+  }
+  return '';
+}
 const EL15_BAT = { liion: ['Li-ion', 3.0, 4.2], lifepo4: ['LiFePO4', 2.5, 3.65], lihv: ['Li-ion HV', 3.1, 4.35], nimh: ['NiMH', 1.0, 1.42], pb: ['Свинцовый', 1.75, 2.15] };
 const el15f = (v, d) => Number.isFinite(v) ? v.toFixed(d) : '–';
 
@@ -54,6 +91,12 @@ class EL15 extends Device {
     this.alive = true;
     await this.readSettings();
     await this.applySavedCal();
+    if (this.hasBuf) {
+      try {
+        c.adcRate = +(await this.q('MEAS:RATE?')) || 40;
+        for (let k = 0; k < 60 && (await this.drainBuf(false)) >= EL15_BUF_MAX; k++);
+      } catch (e) { this.fail(e); }
+    }
     this.loop();
   }
   parseMeas(csv) {
@@ -71,7 +114,9 @@ class EL15 extends Device {
     if (!L) return null;
     const c = this.s, now = performance.now();
     c.live = L; c.rev++;
-    for (const k of ['v', 'i', 'p', 'ah', 'wh', 't', 'fan']) Hub.push('el15.' + k, L[k], now);
+    /* С 4.7.0 U, I и P идут из буфера прибора: каждое измерение со своим временем. */
+    if (this.hasBuf) await this.drainBuf(true);
+    for (const k of this.hasBuf ? ['ah', 'wh', 't', 'fan'] : ['v', 'i', 'p', 'ah', 'wh', 't', 'fan']) Hub.push('el15.' + k, L[k], now);
     Hub.push('el15.r', L.i > .0005 && L.r < 9999 ? L.r : NaN, now);
     Hub.push('el15.ext', L.ext, now);
     Hub.push('el15.dcr', L.dcr > 0 ? L.dcr / 1000 : NaN, now);
@@ -93,7 +138,7 @@ class EL15 extends Device {
         if (t0 - special >= 550) { special = t0; await this.pollStat(m); }
         if (++n % 8 === 0) await this.logStat();
         if (this.state !== 'ok') { this.state = 'ok'; this.emit('state'); }
-        if (t0 - last >= 1000) { c.rate = got / ((t0 - last) / 1000); got = 0; last = t0; this.emit('rate'); }
+        if (t0 - last >= 1000) { c.rate = got / ((t0 - last) / 1000); c.sps = ((c.bufN || 0) - (c.bufN0 || 0)) / ((t0 - last) / 1000); c.bufN0 = c.bufN || 0; got = 0; last = t0; this.emit('rate'); }
         await this.pollCustom(t0);
       } catch (e) { if (!this.alive) return; this.fail(e); await sleep(400); }
       const min = this.link.tr.kind === 'bt' ? 150 : 0;
@@ -189,6 +234,7 @@ class EL15 extends Device {
     const blk = r => { const f = r.split(',').map(Number); return f.length >= 11 ? { idx: f[0], x: [f[1], f[2], f[3]], y: [f[4], f[5], f[6]], off01: f[7], s01: f[8], off12: f[9], s12: f[10] } : null; };
     for (let i = 0; i < cal.hw; i++) { cal.act[i] = blk(await this.q(`CAL:ADC? ${i}`)); cal.fac[i] = blk(await this.q(`CAL:ADC:FACT? ${i}`)); }
     cal.dac = await this.q('CAL:DAC?').catch(() => ''); cal.dacFac = await this.q('CAL:DAC:FACT?').catch(() => '');
+    if (this.hasPnt) cal.pnt = await this.readPnts();
     this.cal = cal; this.emit('cal');
     return cal;
   }
@@ -205,7 +251,60 @@ class EL15 extends Device {
   }
   get calKey() { return 'el15.cal.' + (this.serial || 'el15'); }
   savedCal() { return store.get(this.calKey, null) || { auto: true, trims: {} }; }
+  /* 4.7.0: каждое измерение АЦП попадает в буфер прибора (1024 штуки), MEAS:BUF? отдаёт
+     накопленное: seq,n,t0,t1;U,I;U,I... (не больше 22 за ответ, t — мс часов прибора).
+     Время точек — часы прибора плюс смещение к часам Пульта, взятое по свежим ответам. */
+  get hasBuf() { return el15Ver(this.fw) >= 40700; }
+  async drainBuf(push = true) {
+    const c = this.s;
+    let n = 0;
+    for (let k = 0; k < 12; k++) {
+      const r = await this.q('MEAS:BUF?', { timeout: 900 }), now = performance.now();
+      const [head, ...S] = r.split(';'), h = head.split(',').map(Number), [seq, cnt, t0, t1] = h;
+      if (!(cnt >= 0 && cnt <= EL15_BUF_MAX) || S.length !== cnt) throw new Error('MEAS:BUF?: непонятный ответ');
+      if (c.bufSeq != null && seq > c.bufSeq) c.bufLost = (c.bufLost || 0) + seq - c.bufSeq;
+      c.bufSeq = seq + cnt; n = cnt;
+      if (!cnt) return 0;
+      const est = now - t1;
+      if (cnt < EL15_BUF_MAX) c.tickOff = c.tickOff == null || est < c.tickOff || est - c.tickOff > 500 ? est : c.tickOff + .02 * (est - c.tickOff);
+      if (push) {
+        const off = c.tickOff ?? est;
+        for (let j = 0; j < cnt; j++) {
+          const [v, i] = S[j].split(',').map(Number);
+          const t = Math.max(off + (cnt > 1 ? t0 + (t1 - t0) * j / (cnt - 1) : t1), (c.bufT || 0) + .01);
+          c.bufT = t; c.bufN = (c.bufN || 0) + 1;
+          Hub.push('el15.v', v, t); Hub.push('el15.i', i, t); Hub.push('el15.p', v * i, t);
+        }
+      }
+      if (cnt < EL15_BUF_MAX) return cnt;
+    }
+    return n;
+  }
+  async setAdcRate(sps) { await this.w(`MEAS:RATE ${sps}`); const r = +(await this.q('MEAS:RATE?')); this.s.adcRate = r; if (r !== +sps) throw new Error(`прибор оставил ${r}`); return r; }
+  /* С 4.5.2 поправка хранится в приборе, с 4.6.0 есть 8 точек на канал. */
+  get calInFlash() { return el15Ver(this.fw) >= 40502; }
+  get hasPnt() { return el15Ver(this.fw) >= 40600; }
+  async readPnt(ch) {
+    const f = (await this.q(`CAL:PNT? ${ch}`)).split(',').map(Number), n = f[0];
+    if (!(n >= 0 && n <= 8) || f.length < 1 + 2 * n) throw new Error(`CAL:PNT? ${ch}: непонятный ответ`);
+    return Array.from({ length: n }, (_, k) => [f[1 + 2 * k], f[2 + 2 * k]]);
+  }
+  async readPnts() { this.pnt = []; for (let ch = 0; ch < 3; ch++) this.pnt[ch] = await this.readPnt(ch); return this.pnt; }
+  /* Точки по одной (строка команды в приборе не длиннее 160 символов), затем фиксация:
+     прибор сортирует, проверяет, применяет и сохраняет. После каждой — SYST:ERR?. */
+  async writePnt(ch, P) {
+    const err = async what => { const e = await this.q('SYST:ERR?'); if (!/^[+]?0\b/.test(e)) throw new Error(`${what}: прибор ответил ${e}`); };
+    await this.q('SYST:ERR?');
+    for (let k = 0; k < P.length; k++) { await this.w(`CAL:PNT ${ch},${k},${P[k][0].toFixed(6)},${P[k][1].toFixed(6)}`); await err(`точка ${k + 1}`); }
+    await this.w(`CAL:PNT ${ch},${P.length}`); await err('запись точек');
+    const back = await this.readPnt(ch);
+    if (back.length !== P.length) throw new Error(`прибор вернул ${back.length} точек вместо ${P.length}`);
+    (this.pnt ??= [])[ch] = back;
+    const s = this.savedCal(); (s.pnt ??= [])[ch] = back; s.at = new Date().toISOString(); store.set(this.calKey, s);
+    return back;
+  }
   async applySavedCal() {
+    if (this.calInFlash) return;
     const s = store.get(this.calKey, null);
     if (!s?.auto || !Object.keys(s.trims || {}).length) return;
     try {
@@ -224,11 +323,11 @@ class SimEL15 extends SimBase {
     super();
     Object.assign(this, { mode: 'CC', on: false, kelvin: 0, lock: 0, fault: 0, ah: 0, wh: 0, sec: 0, temp: 27, fan: 0, last: performance.now(), t0: 0, ext: 24.5, dcr: 0, latch: 0 });
     this.set = { CC: .5, CV: 5, CR: 10, CP: 10 };
-    this.prot = { ovp: 62, ocp: 12.3, opp: 153, otp: 90, uvp: 0, von: 0, eotp: 60, eotpOn: 0 };
+    this.prot = { ovp: 62, ocp: 12.3, opp: 255, otp: 90, uvp: 0, von: 0, eotp: 60, eotpOn: 0 };
     this.p = { timOn: 0, timSec: 3600, batI: 1, batCut: 3, batTim: 3600, batTimOn: 0, tail: 0, iend: .1, dcrI1: .1, dcrI2: 1, dynIa: .5, dynTa: 100000, dynIb: 2, dynTb: 100000, dynCyc: 1000, dynInf: 0, scanIl: .5, scanIh: 2, scanRise: 1000, scanFall: 1000, scanCyc: 100, scanInf: 0, listCyc: 100, listInf: 0, psuStart: .2, psuRated: 1, psuStop: 5, psuStep: .1, psuDwell: 250, psuVt: 0, ledVo: 12, ledIo: 1, ledRd: .2, mpptI0: .5, mpptStep: .02, mpptDwell: 200, mpptVmin: 3, tripI: 3, tripVt: 1, tripTmax: 10000, tripBlank: 25, bright: 7, beep: 1, scrOff: 0, crcc: 1, soft: 0, wdt: 0 };
     this.list = Array.from({ length: 10 }, (_, k) => ({ en: k < 4 ? 1 : 0, i: .5 * (k + 1), us: 250000 }));
     this.log = { en: 0, ms: 1000, pts: [], next: 0 };
-    this.trim = {}; this.bat = 0; this.psuTrip = 0; this.mppt = { run: 0, i: .5, pmax: 0, vmp: 0, imp: 0, dir: 1, t: 0, pPrev: 0 }; this.trip = { st: 'IDLE', ms: 0, ip: 0, vt: 0 };
+    this.trim = {}; this.pnt = [[], [], []]; this.pntEdit = [[], [], []]; this.err = 0; this.bat = 0; this.psuTrip = 0; this.mppt = { run: 0, i: .5, pmax: 0, vmp: 0, imp: 0, dir: 1, t: 0, pPrev: 0 }; this.trip = { st: 'IDLE', ms: 0, ip: 0, vt: 0 };
     this.ocp = { st: 0, vnl: 0, ih: 0, vh: 0, it: 0, pm: 0, i: 0, t: 0 }; this.psu = [0, 0, 0, 0, 0, 0, 0, 0];
     this.true = { v: 12, i: 0 };
     SimWorld.el15 = this;
@@ -328,7 +427,8 @@ class SimEL15 extends SimBase {
   meas() {
     this.step();
     const { v, i } = this.true, k = this.kelvin;
-    const V = this.rd(v - (k ? 0 : i * .012), k ? 2 : 0, k ? .9978 : 1.0031, k ? -.002 : .006) + rnd(4e-4), I = this.rd(i, 4, .9952, .0021 * (i > 0)) + rnd(1e-4) * (i > 0), P = V * I;
+    const V = el15Pwl(this.pnt[k ? 1 : 0], this.rd(v - (k ? 0 : i * .012), k ? 2 : 0, k ? .9978 : 1.0031, k ? -.002 : .006) + rnd(4e-4)),
+      I = el15Pwl(this.pnt[2], this.rd(i, 4, .9952, .0021 * (i > 0)) + rnd(1e-4) * (i > 0)), P = V * I;
     const pr = this.prot;
     return [V, I, P, I > .0005 ? V / I : 9999.9, this.temp, this.ah, this.wh, this.sec | 0, this.on ? 1 : 0, 0, this.mode, this.mode in EL15_BASIC ? this.set[this.mode] : 0, this.fault, k, this.lock, this.fan, pr.ovp, pr.ocp, pr.opp, pr.otp, pr.uvp, pr.von, this.dcr, this.ext + rnd(.05)]
       .map(x => typeof x === 'number' ? +x.toFixed(5) : x).join(',');
@@ -338,8 +438,18 @@ class SimEL15 extends SimBase {
     const hd = m[1].toUpperCase(), arg = m[2].trim(), q = hd.endsWith('?'), k = hd.replace(/\?$/, ''), num = parseFloat(arg), a = arg.split(',').map(parseFloat), p = this.p, pr = this.prot;
     const set = (o, key, v = num) => { o[key] = v; return null; };
     switch (k) {
-      case '*IDN': return 'ALIENTEK,ATK-EL15,EL15-DEMO-0001,4.3.1';
-      case 'SYST:ERR': return '0,"No error"';
+      case '*IDN': return 'ALIENTEK,ATK-EL15,EL15-DEMO-0001,4.7.0';
+      case 'MEAS:RATE': if (q) return String(this.adcRate || 40); if (!EL15_RATES.some(([r]) => r === num)) { this.err = -222; return null; } this.adcRate = num; return null;
+      case 'MEAS:BUF': {
+        /* Измерения с частотой АЦП/2 с момента прошлого запроса, не больше 1024 в запасе. */
+        const now = performance.now(), per = 2000 / (this.adcRate || 40);
+        this.buf ??= []; this.bufSeq ??= 0; this.bufT ??= now;
+        while (this.bufT + per <= now) { this.bufT += per; const m = this.meas().split(','); this.buf.push([this.bufSeq++, Math.round(this.bufT) >>> 0, +m[0], +m[1]]); }
+        if (this.buf.length > 1024) this.buf.splice(0, this.buf.length - 1024);
+        const b = this.buf.splice(0, EL15_BUF_MAX), seq = b.length ? b[0][0] : this.bufSeq;
+        return [[seq, b.length, ...(b.length ? [b[0][1], b[b.length - 1][1]] : [])].join(','), ...b.map(x => `${x[2].toFixed(5)},${x[3].toFixed(5)}`)].join(';');
+      }
+      case 'SYST:ERR': { const e = this.err; this.err = 0; return e ? `${e},"Error"` : '0,"No error"'; }
       case 'MEAS:ALL': return this.meas();
       case 'FUNC': if (q) return this.mode; this.mode = arg.toUpperCase(); if (this.mode === 'OCP') this.mode = 'PSU'; this.t0 = performance.now(); return null;
       case 'INP': if (/^(ON|1)$/i.test(arg)) { if (!this.on) this.run(this.mode); if (this.mode === 'BAT') { this.bat = this.ah; this.batI = p.batI; this.batCv = 0; } } else { this.on = false; this.mppt.run = 0; if (this.ocp.st === 1) this.ocp.st = 0; } return null;
@@ -393,7 +503,17 @@ class SimEL15 extends SimBase {
       case 'LOG:INT': this.log.ms = num || 1000; return null;
       case 'LOG:CLE': this.log.pts = []; return null;
       case 'LOG:DATA': return this.log.pts.slice(a[0], a[0] + a[1]).map(x => x.map(v => v.toFixed(4)).join(',')).join(';');
-      case 'CAL:STAT': return `8,${Object.keys(this.trim).length ? 1 : 0},${this.kelvin},0,0,0,1.000000`;
+      case 'CAL:STAT': return `8,${Object.keys(this.trim).length || this.pnt.some(P => P.length) ? 1 : 0},${this.kelvin},0,0,0,1.000000`;
+      case 'CAL:PNT': {
+        const ch = a[0];
+        if (!(ch >= 0 && ch < 3)) { this.err = -222; return q ? '' : null; }
+        if (q) { const P = this.pnt[ch | 0]; return [P.length, ...P.flat().map(x => x.toFixed(6))].join(','); }
+        if (a.length === 4) { if (!(a[1] >= 0 && a[1] < 8)) { this.err = -222; return null; } this.pntEdit[ch | 0][a[1] | 0] = [a[2], a[3]]; return null; }
+        if (a.length !== 2 || !(a[1] >= 0 && a[1] <= 8)) { this.err = a.length === 2 ? -222 : -108; return null; }
+        const P = this.pntEdit[ch | 0].slice(0, a[1] | 0).map(p => p || [0, 0]).sort((x, y) => x[0] - y[0]);
+        if (el15PntCheck(P, '')) { this.err = -222; return null; }
+        this.pnt[ch | 0] = P; return null;
+      }
       case 'CAL:ADC': case 'CAL:ADC:FACT': {
         const i = a[0] | 0, cur = i >= 4, x = cur ? [0, 2000, 12000] : [0, 6000, 62000], y = x.map(v => v / 1000), [g, o] = k === 'CAL:ADC' && this.trim[i] ? this.trim[i] : [1, 0];
         const yy = y.map(v => v * g + o), s01 = (yy[1] - yy[0]) / (x[1] - x[0]), s12 = (yy[2] - yy[1]) / (x[2] - x[1]);
@@ -401,7 +521,7 @@ class SimEL15 extends SimBase {
       }
       case 'CAL:DAC': case 'CAL:DAC:FACT': return '1.000000,0.00100,1.2000,1000.000,0.00100,12.000,1000.000,0.00500,30.000,500.000,0.00500,30.000,500.000';
       case 'CAL:TRIM': if (a[1] === 1 && a[2] === 0) delete this.trim[a[0] | 0]; else this.trim[a[0] | 0] = [a[1], a[2]]; return null;
-      case 'CAL:REST': this.trim = {}; return null;
+      case 'CAL:REST': this.trim = {}; this.pnt = [[], [], []]; return null;
       default: return q ? '' : null;
     }
   }
@@ -478,7 +598,7 @@ WM.define('el15-main', {
         const s = stats.cells;
         s.r.textContent = L.i > .0005 && L.r < 9999 ? fmtSI(L.r, 'Ω', 4) : '∞'; s.t.textContent = el15f(L.t, 1) + ' °C'; s.ext.textContent = Number.isFinite(L.ext) ? el15f(L.ext, 1) + ' °C' : 'нет';
         s.ah.textContent = el15f(L.ah, 4) + ' Ah'; s.wh.textContent = el15f(L.wh, 3) + ' Wh'; s.sec.textContent = elHms(L.sec); s.fan.textContent = L.fan + ' %';
-        s.dcr.textContent = L.dcr > 0 ? el15f(L.dcr, 1) + ' мОм' : '–'; s.rate.textContent = c.rate.toFixed(1) + '/с';
+        s.dcr.textContent = L.dcr > 0 ? el15f(L.dcr, 1) + ' мОм' : '–'; s.rate.textContent = c.rate.toFixed(1) + '/с' + (dev.hasBuf ? `, измерений ${(c.sps || 0).toFixed(0)}/с${c.bufLost ? `, потеряно ${c.bufLost}` : ''}` : '');
         modeChip.textContent = `${EL15_MODE_NAMES[L.mode] || L.mode}${EL15_BASIC[L.mode] ? `, уставка ${L.setp} ${EL15_BASIC[L.mode].unit}` : ''}`;
         faultChip.hidden = !L.fault; faultChip.textContent = EL15_FAULTS[L.fault] || 'авария ' + L.fault;
         sense.textContent = L.kelvin ? 'Измерение 4W' : 'Измерение 2W'; lock.textContent = L.lock ? 'Кнопки заблокированы' : 'Кнопки свободны';
@@ -707,10 +827,10 @@ WM.define('el15-prot', {
   title: 'EL15: защиты и настройки', dev: 'el15', devName: 'EL15', w: 600, h: 600,
   make(win, dev, cfg) {
     const c = dev.s, s = c.set;
-    const P = { ovp: 62, ocp: 12.3, opp: 153, otp: 90, uvp: 0, von: 0, eotp: s.eotp ?? 60 };
+    const P = { ovp: 62, ocp: 12.3, opp: 255, otp: 90, uvp: 0, von: 0, eotp: s.eotp ?? 60 };
     const fromLive = () => { const L = c.live; if (L) for (const k of ['ovp', 'ocp', 'opp', 'otp', 'uvp', 'von']) if (Number.isFinite(L[k])) P[k] = L[k]; P.eotp = s.eotp ?? P.eotp; };
     fromLive();
-    const prot = elForm([['ovp', 'Перенапряжение OVP', 'V', { min: 0, max: 62 }], ['ocp', 'Перегрузка по току OCP', 'A', { min: 0, max: 12.3 }], ['opp', 'Перегрузка по мощности OPP', 'W', { min: 0, max: 153 }], ['otp', 'Перегрев транзисторов OTP', '°C', { min: 40, max: 100, int: true }], ['eotp', 'Перегрев по внешнему датчику', '°C', { min: 40, max: 125 }]], P);
+    const prot = elForm([['ovp', 'Перенапряжение OVP', 'V', { min: 0, max: 62 }], ['ocp', 'Перегрузка по току OCP', 'A', { min: 0, max: 12.3 }], ['opp', 'Перегрузка по мощности OPP', 'W', { min: 0, max: 255 }], ['otp', 'Перегрев транзисторов OTP', '°C', { min: 40, max: 100, int: true }], ['eotp', 'Перегрев по внешнему датчику', '°C', { min: 40, max: 125 }]], P);
     const eotpOn = toggle('Защита по внешнему датчику', !!s.eotpOn, v => { s.eotpOn = v; });
     const volt = elForm([['uvp', 'Отключить ниже (UVP)', 'V', { min: 0, max: 60 }], ['von', 'Включаться от (Von)', 'V', { min: 0, max: 60 }]], P, k => dev.w(`${k === 'uvp' ? 'VOLT:UVP' : 'VOLT:ON'} ${P[k]}`).catch(errToast));
     const pick = (opts, v, cmd, label, key) => select(opts.map(x => Array.isArray(x) ? x : [x, String(x)]), v, x => { if (key) s[key] = +x; dev.w(`${cmd} ${x}`).catch(errToast); }, label);
@@ -736,6 +856,11 @@ WM.define('el15-prot', {
       h('h4', { text: 'Вентилятор' }), fan,
       h('h4', { text: 'Прибор' }),
       h('div', { class: 'ctl-grid' }, field('Яркость', bright), field('Звук', beep), field('Гасить экран', scr), field('Опрос Пультом', poll)),
+      dev.hasBuf ? h('div', { class: 'col' },
+        h('div', { class: 'ctl-grid' }, field('Частота АЦП, преобр./с', select(EL15_RATES, c.adcRate || 40, async v => {
+          try { const r = await dev.setAdcRate(v); toast(`EL15: АЦП ${r} преобр./с, около ${Math.round(r / 2)} измерений в секунду`, 'ok'); } catch (e) { errToast(e); }
+        }, 'Частота АЦП'))),
+        h('p', { class: 'note', text: 'АЦП по очереди меряет напряжение и ток (при токе больше 1,2 А — ещё второй канал тока), поэтому измерений в секунду вдвое-втрое меньше, чем преобразований. Чем выше частота, тем больше шум в последних знаках; калибровка сделана на 40, после смены частоты сверьте показания с эталоном. Прибор запоминает частоту; в сервисном режиме всегда 40.' })) : '',
       h('div', { class: 'row wrap' }, h('button', { class: 'btn', onclick: () => dev.w('SYST:BEEP:IMM').catch(errToast) }, 'Пискнуть'),
         h('button', { class: 'btn', onclick: () => dev.w('SYST:SAVE').then(() => toast('Настройки сохранены во флеш прибора', 'ok')).catch(errToast) }, 'Сохранить во флеш прибора'),
         h('button', { class: 'btn', onclick: async () => { if (await c2Ask('Вернуть все настройки EL15 к заводским? Вход будет выключен.')) { await dev.w('INP OFF;SYST:REST').catch(errToast); await dev.readSettings(); } } }, 'Заводские настройки'),
@@ -769,10 +894,14 @@ WM.define('el15-log', {
   },
 });
 
-/* ---------- Калибровка по DM40: напряжение 2W и 4W, ток. Пишется поправкой CAL:TRIM поверх
-   заводской таблицы; прибор держит её в ОЗУ, Пульт записывает её снова при каждом подключении. ---------- */
+/* ---------- Калибровка по DM40: напряжение 2W и 4W, ток.
+   Прошивка 4.6.0 и новее: до 8 точек на величину, кусочно-линейная поправка (CAL:PNT), прибор
+   хранит её сам. Показание EL15 при снятии точки пересчитывается обратно через действующие
+   точки, поэтому старую поправку снимать не нужно, и прибор не меняется до «Записать».
+   Прошивка старше: точки сводятся к прямой и пишутся поправкой CAL:TRIM поверх заводской
+   таблицы; до 4.5.2 прибор держал её в ОЗУ, и Пульт записывал её снова при каждом подключении. ---------- */
 /* Калибровка по эталону, как у C2: величина, эталон, точки, запись. Напряжение калибруется
-   отдельно для измерения 2W и 4W (свои блоки АЦП), ток — по каналу 1. */
+   отдельно для измерения 2W и 4W (свои блоки АЦП), ток — по сумме каналов. */
 const EL15_CAL_T = {
   v2: { name: 'Напряжение 2W', q: 'el15.v', unit: 'V', sense: '2W', dm: 'VOLT' },
   v4: { name: 'Напряжение 4W', q: 'el15.v', unit: 'V', sense: '4W', dm: 'VOLT' },
@@ -793,7 +922,10 @@ WM.define('el15-cal', {
     const mean = a => a.reduce((s, x) => s + x, 0) / (a.length || 1);
     const idx = () => el15CalIdx(dev.cal?.hw || 8, cfg.t);
     const elNow = () => Hub.q.get(T().q)?.last;
-    const refNow = () => cfg.ref === 'manual' ? parseFloat(String(manual.value).replace(',', '.')) : Devices.get('dm40') ? Hub.q.get('dm40.main')?.last : NaN;
+    /* Показание EL15 без 8-точечной поправки этой величины (её точки известны из прибора). */
+    const chOf = () => EL15_PNT_CH[cfg.t];
+    const elRaw = () => { const v = elNow(); return dev.hasPnt ? el15PwlInv(dev.pnt?.[chOf()] || [], v) : v; };
+    const refNow =() => cfg.ref === 'manual' ? parseFloat(String(manual.value).replace(',', '.')) : Devices.get('dm40') ? Hub.q.get('dm40.main')?.last : NaN;
     /* EL15 переключается на нужное измерение (2W или 4W), DM40 — на V⎓ или A⎓ сами. */
     const dmOk = () => { const d = Devices.get('dm40'); return cfg.ref === 'manual' || !!d && (d.s.func === T().dm || d.s.func === T().dm + ':AUTO'); };
     async function sense() {
@@ -806,7 +938,10 @@ WM.define('el15-cal', {
     async function read() {
       try {
         const cal = await dev.readCal();
-        st.textContent = `В EL15 ${cal.user ? 'действует поправка' : 'заводская калибровка'}, измерение ${cal.kelvin ? '4W' : '2W'}.${dev.calApplied ? ' Поправка из Пульта записана при подключении.' : ''}`;
+        if (dev.hasPnt) {
+          const n = cal.pnt.map(P => P.length);
+          st.textContent = `Прошивка ${dev.fw}: поправка хранится в EL15. Точек: напряжение 2W — ${n[0]}, 4W — ${n[1]}, ток — ${n[2]}${cal.user && !n.some(Boolean) ? '; действует поправка CAL:TRIM' : ''}. Измерение ${cal.kelvin ? '4W' : '2W'}.`;
+        } else st.textContent = `В EL15 ${cal.user ? 'действует поправка' : 'заводская калибровка'}, измерение ${cal.kelvin ? '4W' : '2W'}.${dev.calApplied ? ' Поправка из Пульта записана при подключении.' : ''}${dev.calInFlash ? ' Прибор хранит поправку сам.' : ''}`;
         if (!store.get('el15.calbak.' + dev.serial, null)) store.set('el15.calbak.' + dev.serial, backup());
       } catch (e) { st.textContent = 'Таблицы калибровки не прочитаны: ' + e.message; }
     }
@@ -815,8 +950,10 @@ WM.define('el15-cal', {
       if (pts[cfg.t].length >= 8) { toast('Не больше 8 точек на величину', 'bad'); return; }
       if (T().sense && c.live?.on) { toast('Выключите вход нагрузки: напряжение калибруется без тока', 'bad'); return; }
       if (!dmOk()) { toast(`DM40 не в режиме ${T().dm === 'VOLT' ? 'V⎓' : 'A⎓'}`, 'bad'); sense(); return; }
+      if (T().sense && !!c.live?.kelvin !== (T().sense === '4W')) { toast(`EL15 ещё не в режиме ${T().sense}`, 'bad'); sense(); return; }
+      if (dev.hasPnt && !dev.pnt) await read();
       const a = { el: [], ref: [] }, t0 = performance.now();
-      while (performance.now() - t0 < 2000) { const e = elNow(), r = refNow(); if (Number.isFinite(e)) a.el.push(e); if (Number.isFinite(r)) a.ref.push(r); await sleep(200); }
+      while (performance.now() - t0 < 2000) { const e = elRaw(), r = refNow(); if (Number.isFinite(e)) a.el.push(e); if (Number.isFinite(r)) a.ref.push(r); await sleep(200); }
       if (!a.el.length || !a.ref.length) { toast('Нет показаний эталона или EL15', 'bad'); return; }
       pts[cfg.t].push({ el: mean(a.el), ref: mean(a.ref) }); pts[cfg.t].sort((x, y) => x.el - y.el); drawPts();
     }
@@ -835,6 +972,7 @@ WM.define('el15-cal', {
         h('td', {}, h('button', { class: 'wbtn', 'aria-label': 'Убрать точку', onclick: () => { P.splice(k, 1); drawPts(); } }, '×')))));
     }
     async function write() {
+      if (dev.hasPnt) return writePnt();
       const f = solve(pts[cfg.t]);
       if (!f) { toast('Сначала добавьте точки', 'bad'); return; }
       try {
@@ -846,20 +984,43 @@ WM.define('el15-cal', {
         toast(`${T().name}: калибровка записана в EL15`, 'ok'); pts[cfg.t] = []; drawPts(); await read();
       } catch (e) { errToast(e); }
     }
+    /* 8 точек: прибор сам сортирует, проверяет и сохраняет; здесь те же проверки заранее. */
+    async function writePnt() {
+      const P = pts[cfg.t].map(p => [p.el, p.ref]).sort((x, y) => x[0] - y[0]);
+      if (!P.length) { toast('Сначала добавьте точки', 'bad'); return; }
+      const bad = el15PntCheck(P, T().unit);
+      if (bad) { toast(`Не записано: ${bad}`, 'bad'); return; }
+      const worst = Math.max(0, ...P.filter(([x]) => Math.abs(x) > .01).map(([x, y]) => Math.abs(y / x - 1)));
+      if (worst > .02 && !(await c2Ask(`Поправка до ${(worst * 100).toFixed(2)} % — это много. Проверьте подключение эталона. Всё равно записать?`))) return;
+      try {
+        await dev.writePnt(chOf(), P);
+        toast(`${T().name}: ${P.length} ${P.length === 1 ? 'точка записана' : P.length < 5 ? 'точки записаны' : 'точек записано'} в EL15`, 'ok');
+        pts[cfg.t] = []; drawPts(); await read();
+      } catch (e) { errToast(e); }
+    }
     async function reset() {
       if (!(await c2Ask(`Убрать поправку «${T().name}»? Останется заводская калибровка.`))) return;
-      try { const i = idx(); await dev.w(`CAL:TRIM ${i},1.000000,0.00000`); const s = dev.savedCal(); delete s.trims[i]; store.set(dev.calKey, s); toast('Поправка убрана', 'ok'); await read(); } catch (e) { errToast(e); }
+      try {
+        const i = idx(), s = dev.savedCal();
+        if (dev.hasPnt) { await dev.w(`CAL:PNT ${chOf()},0`); (dev.pnt ??= [])[chOf()] = []; if (s.pnt) s.pnt[chOf()] = []; }
+        await dev.w(`CAL:TRIM ${i},1.000000,0.00000`); delete s.trims[i]; store.set(dev.calKey, s);
+        toast('Поправка убрана', 'ok'); await read();
+      } catch (e) { errToast(e); }
     }
-    function backup() { return { model: 'ATK-EL15', serial: dev.serial, at: new Date().toISOString(), hw: dev.cal?.hw, trims: dev.savedCal().trims, act: dev.cal?.act, fac: dev.cal?.fac }; }
+    function backup() { return { model: 'ATK-EL15', serial: dev.serial, fw: dev.fw, at: new Date().toISOString(), hw: dev.cal?.hw, trims: dev.savedCal().trims, pnt: dev.cal?.pnt, act: dev.cal?.act, fac: dev.cal?.fac }; }
     async function restore(j) {
-      j ??= { trims: dev.savedCal().trims };
-      const trims = j.trims || {};
-      if (!Object.keys(trims).length) { toast('В копии нет поправок', 'bad'); return; }
-      try { for (const [i, [g, o]] of Object.entries(trims)) await dev.setTrim(+i, +g, +o); toast('Калибровка восстановлена в EL15', 'ok'); await read(); } catch (e) { errToast(e); }
+      j ??= dev.savedCal();
+      const trims = j.trims || {}, pnt = dev.hasPnt && Array.isArray(j.pnt) ? j.pnt : [];
+      if (!Object.keys(trims).length && !pnt.some(P => P?.length)) { toast('В копии нет поправок', 'bad'); return; }
+      try {
+        for (const [i, [g, o]] of Object.entries(trims)) await dev.setTrim(+i, +g, +o);
+        for (let ch = 0; ch < 3; ch++) if (pnt[ch]?.length) await dev.writePnt(ch, pnt[ch]);
+        toast('Калибровка восстановлена в EL15', 'ok'); await read();
+      } catch (e) { errToast(e); }
     }
     async function factory() {
       if (!(await c2Ask('Вернуть заводскую калибровку EL15? Поправки, которые хранит Пульт, будут забыты.'))) return;
-      try { await dev.w('CAL:REST'); store.set(dev.calKey, { ...dev.savedCal(), trims: {} }); toast('В EL15 заводская калибровка', 'ok'); await read(); } catch (e) { errToast(e); }
+      try { await dev.w('CAL:REST'); dev.pnt = [[], [], []]; store.set(dev.calKey, { ...dev.savedCal(), trims: {}, pnt: [] }); toast('В EL15 заводская калибровка', 'ok'); await read(); } catch (e) { errToast(e); }
     }
     win.body.append(h('div', { class: 'col pad scroll' }, st,
       h('h4', { text: 'Напряжение и ток по эталону' }),
@@ -868,8 +1029,10 @@ WM.define('el15-cal', {
       h('div', { class: 'row wrap' }, h('button', { class: 'btn primary', onclick: addPoint }, 'Добавить точку'), h('button', { class: 'btn', onclick: write }, 'Записать в прибор'), h('button', { class: 'btn', onclick: reset }, 'Сбросить в приборе')),
       h('table', { class: 'grid' }, h('thead', {}, h('tr', {}, ...['EL15 без поправки', 'Эталон', 'Поправка', ''].map(t => h('th', { text: t })))), ptBody),
       h('h4', { text: 'Резервная копия' }),
-      h('p', { class: 'note', text: 'Заводские таблицы EL15 не меняются: поправка лежит в его памяти до выключения. Пульт хранит её для каждого прибора и записывает снова при подключении.' }),
-      h('div', { class: 'row wrap' }, auto),
+      h('p', { class: 'note', text: dev.hasPnt ? 'Заводские таблицы EL15 не меняются. Поправка (до 8 точек на величину) хранится в самом приборе и действует после выключения; «Вернуть заводскую» стирает её. Копия в файле или в Пульте нужна на случай перепрошивки.'
+        : dev.calInFlash ? 'Заводские таблицы EL15 не меняются. Поправка хранится в самом приборе и действует после выключения. Копия в файле или в Пульте нужна на случай перепрошивки.'
+        : 'Заводские таблицы EL15 не меняются: поправка лежит в его памяти до выключения. Пульт хранит её для каждого прибора и записывает снова при подключении.' }),
+      dev.calInFlash ? '' : h('div', { class: 'row wrap' }, auto),
       h('div', { class: 'row wrap' }, h('button', { class: 'btn', onclick: () => saveFile(`el15-calibrovka-${dev.serial || ''}-${stamp()}.json`, JSON.stringify(backup()), 'application/json') }, 'Сохранить копию в файл'), h('button', { class: 'btn', onclick: () => restore() }, 'Восстановить из Пульта'), h('button', { class: 'btn', onclick: () => fileIn.click() }, 'Восстановить из файла'), h('button', { class: 'btn', onclick: factory }, 'Вернуть заводскую'), fileIn)));
     drawPts(); read(); sense();
     let tLast = 0;
